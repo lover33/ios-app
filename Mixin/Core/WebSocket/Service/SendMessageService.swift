@@ -17,7 +17,19 @@ class SendMessageService: MixinService {
                 if message.userId == AccountAPI.shared.accountUserId {
                     FileJobQueue.shared.addJob(job: FileUploadJob(message: message))
                 } else {
-                    FileJobQueue.shared.addJob(job: FileDownloadJob(message: message))
+                    FileJobQueue.shared.addJob(job: FileDownloadJob(messageId: message.messageId, mediaMimeType: message.mediaMimeType))
+                }
+            } else if message.category.hasSuffix("_VIDEO") {
+                if message.userId == AccountAPI.shared.accountUserId {
+                    FileJobQueue.shared.addJob(job: VideoUploadJob(message: message))
+                } else {
+                    FileJobQueue.shared.addJob(job: VideoDownloadJob(messageId: message.messageId, mediaMimeType: message.mediaMimeType))
+                }
+            } else if message.category.hasSuffix("_AUDIO") {
+                if message.userId == AccountAPI.shared.accountUserId {
+                    FileJobQueue.shared.addJob(job: AudioUploadJob(message: message))
+                } else {
+                    FileJobQueue.shared.addJob(job: AudioDownloadJob(messageId: message.messageId, mediaMimeType: message.mediaMimeType))
                 }
             }
         }
@@ -50,6 +62,8 @@ class SendMessageService: MixinService {
                         msg.category = MessageCategory.PLAIN_CONTACT.rawValue
                     case MessageCategory.SIGNAL_VIDEO.rawValue:
                         msg.category = MessageCategory.PLAIN_VIDEO.rawValue
+                    case MessageCategory.SIGNAL_AUDIO.rawValue:
+                        msg.category = MessageCategory.PLAIN_AUDIO.rawValue
                     default:
                         break
                     }
@@ -80,6 +94,10 @@ class SendMessageService: MixinService {
             ConcurrentJobQueue.shared.addJob(job: AttachmentUploadJob(message: msg))
         } else if msg.category.hasSuffix("_DATA") {
             FileJobQueue.shared.addJob(job: FileUploadJob(message: msg))
+        } else if msg.category.hasSuffix("_VIDEO") {
+            FileJobQueue.shared.addJob(job: VideoUploadJob(message: msg))
+        } else if msg.category.hasSuffix("_AUDIO") {
+            FileJobQueue.shared.addJob(job: AudioUploadJob(message: msg))
         }
     }
 
@@ -284,7 +302,6 @@ extension SendMessageService {
             return
         }
         guard let conversation = ConversationDAO.shared.getConversation(conversationId: message.conversationId) else {
-            FileManager.default.writeLog(conversationId: message.conversationId, log: "[SendMessageService][SendMessage]...conversation not exist")
             return
         }
 
@@ -309,7 +326,11 @@ extension SendMessageService {
                         ConversationDAO.shared.updateConversation(conversation: response)
                         try sendGroupSenderKey(conversationId: conversation.conversationId)
                     case let .failure(error):
-                        guard !(error.errorCode == 404 || error.errorCode == 403) else {
+                        if error.code == 404 && conversation.status == ConversationStatus.START.rawValue {
+                            try requestCreateConversation(conversation: conversation)
+                            try sendGroupSenderKey(conversationId: conversation.conversationId)
+                            break
+                        } else if error.code == 404 || error.code == 403 {
                             ParticipantDAO.shared.removeParticipant(conversationId: message.conversationId)
                             return
                         }
@@ -323,6 +344,7 @@ extension SendMessageService {
 
             blazeMessage.params?.data = try SignalProtocol.shared.encryptGroupMessageData(conversationId: message.conversationId, senderId: message.userId, content: message.content ?? "")
             try deliverMessage(blazeMessage: blazeMessage)
+
             FileManager.default.writeLog(conversationId: message.conversationId, log: "[SendMessageService][SendMessage][\(message.category)]...isExistSenderKey:\(isExistSenderKey)...messageId:\(messageId)...messageStatus:\(message.status)...orderId:\(job.orderId ?? 0)")
         }
     }
@@ -331,7 +353,7 @@ extension SendMessageService {
         do {
             try deliver(blazeMessage: blazeMessage)
         } catch {
-            guard error.errorCode != 403 else {
+            if let err = error as? APIError, err.code == 403 {
                 return
             }
             throw error

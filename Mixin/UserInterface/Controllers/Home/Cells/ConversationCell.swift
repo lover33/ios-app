@@ -71,7 +71,7 @@ class ConversationCell: UITableViewCell {
                 } else {
                     contentLabel.text = Localized.NOTIFICATION_CONTENT_STICKER
                 }
-                messageTypeImageView.image = #imageLiteral(resourceName: "ic_message_photo")
+                messageTypeImageView.image = #imageLiteral(resourceName: "ic_message_sticker")
                 messageTypeImageView.isHidden = false
             } else if category.hasSuffix("_CONTACT") {
                 if item.isGroup() {
@@ -88,6 +88,22 @@ class ConversationCell: UITableViewCell {
                     contentLabel.text = Localized.NOTIFICATION_CONTENT_FILE
                 }
                 messageTypeImageView.image = #imageLiteral(resourceName: "ic_message_file")
+                messageTypeImageView.isHidden = false
+            } else if category.hasSuffix("_VIDEO") {
+                if item.isGroup() {
+                    contentLabel.text = "\(senderName): \(Localized.NOTIFICATION_CONTENT_VIDEO)"
+                } else {
+                    contentLabel.text = Localized.NOTIFICATION_CONTENT_VIDEO
+                }
+                messageTypeImageView.image = #imageLiteral(resourceName: "ic_message_video")
+                messageTypeImageView.isHidden = false
+            } else if category.hasSuffix("_AUDIO") {
+                if item.isGroup() {
+                    contentLabel.text = "\(senderName): \(Localized.NOTIFICATION_CONTENT_AUDIO)"
+                } else {
+                    contentLabel.text = Localized.NOTIFICATION_CONTENT_AUDIO
+                }
+                messageTypeImageView.image = #imageLiteral(resourceName: "ic_message_audio")
                 messageTypeImageView.isHidden = false
             } else if category == MessageCategory.SYSTEM_ACCOUNT_SNAPSHOT.rawValue {
                 contentLabel.text = Localized.NOTIFICATION_CONTENT_TRANSFER

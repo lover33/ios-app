@@ -95,15 +95,6 @@ class PayView: UIStackView {
         superView?.dismissPopupControllerAnimated()
     }
 
-    @IBAction func profileAction(_ sender: Any) {
-        guard let user = self.user, !avatarImageView.isHidden, !processing else {
-            return
-        }
-        superView?.dismissPopupControllerAnimated()
-        userWindow.updateUser(user: user).presentView()
-    }
-    
-
     class func instance() -> PayView {
         return Bundle.main.loadNibNamed("PayView", owner: nil, options: nil)?.first as! PayView
     }
@@ -151,7 +142,6 @@ extension PayView {
                 superView.popupView.center = superView.getAnimationStartPoint()
             }, completion: { (_) in
                 superView.isShowing = false
-                NotificationCenter.default.postOnMain(name: .WindowDidDisappear)
                 superView.removeFromSuperview()
             })
         } else {
@@ -201,25 +191,30 @@ extension PayView: PinFieldDelegate {
                 weakSelf.payStatusLabel.text = Localized.ACTION_DONE
                 weakSelf.playSuccessSound()
                 weakSelf.delayDismissWindow()
-            case let .failure(error, _):
+            case let .failure(error):
                 weakSelf.processing = false
                 weakSelf.superView?.dismissPopupControllerAnimated()
-                guard error.kind != .cancelled else {
+                guard error.status != NSURLErrorCancelled else {
                     return
                 }
-                let errorMsg = error.kind.localizedDescription ?? error.description
                 if (weakSelf.superView as? UrlWindow)?.fromWeb ?? false {
-                    SwiftMessages.showToast(message: errorMsg, backgroundColor: .hintRed)
+                    SwiftMessages.showToast(message: error.localizedDescription, backgroundColor: .hintRed)
                 } else {
-                    UIApplication.currentActivity()?.alert(errorMsg, message: nil)
+                    UIApplication.currentActivity()?.alert(error.localizedDescription, message: nil)
                 }
             }
         }
 
-        if avatarImageView.isHidden {
-            WithdrawalAPI.shared.withdrawal(withdrawal: WithdrawalRequest(addressId: address.addressId, amount: amount, traceId: trackId, pin: pin, memo: memo), completion: completion)
+        let generalizedAmount: String
+        if let decimalSeparator = Locale.current.decimalSeparator {
+            generalizedAmount = amount.replacingOccurrences(of: decimalSeparator, with: ".")
         } else {
-            AssetAPI.shared.transfer(assetId: assetId, counterUserId: user.userId, amount: amount, memo: memo, pin: pin, traceId: trackId, completion: completion)
+            generalizedAmount = amount
+        }
+        if avatarImageView.isHidden {
+            WithdrawalAPI.shared.withdrawal(withdrawal: WithdrawalRequest(addressId: address.addressId, amount: generalizedAmount, traceId: trackId, pin: pin, memo: memo), completion: completion)
+        } else {
+            AssetAPI.shared.transfer(assetId: assetId, opponentId: user.userId, amount: generalizedAmount, memo: memo, pin: pin, traceId: trackId, completion: completion)
         }
     }
 

@@ -1,4 +1,6 @@
 import UIKit
+import AVKit
+import Photos
 
 extension Notification.Name {
     
@@ -9,6 +11,14 @@ extension Notification.Name {
 }
 
 class ConversationDataSource {
+    
+    private static let videoRequestOptions: PHVideoRequestOptions = {
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.version = .current
+        options.deliveryMode = .fastFormat
+        return options
+    }()
     
     let queue = DispatchQueue(label: "one.mixin.ios.message.processing")
     
@@ -36,8 +46,6 @@ class ConversationDataSource {
     private var didLoadEarliestMessage = false
     private var isLoadingAbove = false
     private var isLoadingBelow = false
-    private var topMessageOffset: Int?
-    private var bottomMessageOffset: Int?
     private var canInsertUnreadHint = true
     private var messageProcessingIsCancelled = false
     private var didInitializedData = false
@@ -68,7 +76,6 @@ class ConversationDataSource {
     }
     
     func initData() {
-        assert(!didInitializedData)
         NotificationCenter.default.addObserver(self, selector: #selector(conversationDidChange(_:)), name: .ConversationDidChange, object: nil)
         queue.async {
             guard !self.messageProcessingIsCancelled else {
@@ -101,26 +108,22 @@ class ConversationDataSource {
     }
     
     func loadMoreAboveIfNeeded() {
-        guard !isLoadingAbove, !didLoadEarliestMessage, let topMessageOffset = topMessageOffset else {
+        guard !isLoadingAbove, !didLoadEarliestMessage else {
             return
         }
         isLoadingAbove = true
         let messagesCountPerPage = self.messagesCountPerPage
         let conversationId = self.conversationId
-        let canInsertEncryptionHint = self.canInsertEncryptionHint
         let layoutWidth = self.layoutWidth
         queue.async {
-            guard !self.messageProcessingIsCancelled else {
+            guard !self.messageProcessingIsCancelled, let firstDate = self.dates.first, let location = self.viewModels[firstDate]?.first?.message else {
                 return
             }
             self.semaphore.wait()
-            var messages = [MessageItem]()
-            if topMessageOffset > 0 {
-                messages = MessageDAO.shared.getMessages(conversationId: conversationId, location: topMessageOffset, count: -messagesCountPerPage)
-            }
-            self.topMessageOffset = topMessageOffset - messages.count
-            self.didLoadEarliestMessage = messages.count < messagesCountPerPage
-            let shouldInsertEncryptionHint = canInsertEncryptionHint && messages.count > 0 && topMessageOffset - messages.count <= 0
+            var messages = MessageDAO.shared.getMessages(conversationId: conversationId, aboveMessage: location, count: messagesCountPerPage)
+            let didLoadEarliestMessage = messages.count < messagesCountPerPage
+            self.didLoadEarliestMessage = didLoadEarliestMessage
+            let shouldInsertEncryptionHint = self.canInsertEncryptionHint && didLoadEarliestMessage
             messages = messages.filter{ !self.loadedMessageIds.contains($0.messageId) }
             self.loadedMessageIds.formUnion(messages.map({ $0.messageId }))
             var (dates, viewModels) = self.viewModels(with: messages, fits: layoutWidth)
@@ -172,7 +175,7 @@ class ConversationDataSource {
     }
     
     func loadMoreBelowIfNeeded() {
-        guard !isLoadingBelow, !didLoadLatestMessage, let bottomMessageOffset = bottomMessageOffset else {
+        guard !isLoadingBelow, !didLoadLatestMessage else {
             return
         }
         isLoadingBelow = true
@@ -181,12 +184,11 @@ class ConversationDataSource {
         let messagesCountPerPage = self.messagesCountPerPage
         let layoutWidth = self.layoutWidth
         queue.async {
-            guard !self.messageProcessingIsCancelled else {
+            guard !self.messageProcessingIsCancelled, let lastDate = self.dates.last, let location = self.viewModels[lastDate]?.last?.message else {
                 return
             }
             self.semaphore.wait()
-            var messages = MessageDAO.shared.getMessages(conversationId: conversationId, location: bottomMessageOffset + 1, count: messagesCountPerPage)
-            self.bottomMessageOffset = bottomMessageOffset + messages.count
+            var messages = MessageDAO.shared.getMessages(conversationId: conversationId, belowMessage: location, count: messagesCountPerPage)
             self.didLoadLatestMessage = messages.count < messagesCountPerPage
             messages = messages.filter{ !self.loadedMessageIds.contains($0.messageId) }
             self.loadedMessageIds.formUnion(messages.map({ $0.messageId }))
@@ -366,10 +368,8 @@ extension ConversationDataSource {
         guard let indexPath = indexPath(where: { $0.messageId == messageId }) else {
             return
         }
-        if let viewModel = viewModel(for: indexPath) {
-            if var viewModel = viewModel as? ProgressInspectableMessageViewModel {
-                viewModel.mediaStatus = mediaStatus.rawValue
-            }
+        if let viewModel = viewModel(for: indexPath) as? MessageViewModel & AttachmentLoadingViewModel {
+            viewModel.mediaStatus = mediaStatus.rawValue
             if let cell = tableView?.cellForRow(at: indexPath) as? MessageCell {
                 cell.render(viewModel: viewModel)
             }
@@ -377,11 +377,11 @@ extension ConversationDataSource {
     }
     
     private func updateMediaProgress(messageId: String, progress: Double) {
-        guard let indexPath = indexPath(where: { $0.messageId == messageId }), var viewModel = viewModel(for: indexPath) as? ProgressInspectableMessageViewModel else {
+        guard let indexPath = indexPath(where: { $0.messageId == messageId }), let viewModel = viewModel(for: indexPath) as? MessageViewModel & AttachmentLoadingViewModel else {
             return
         }
         viewModel.progress = progress
-        if let cell = tableView?.cellForRow(at: indexPath) as? ProgressInspectableMessageCell {
+        if let cell = tableView?.cellForRow(at: indexPath) as? AttachmentLoadingMessageCell {
             cell.updateProgress(viewModel: viewModel)
         }
     }
@@ -433,41 +433,23 @@ extension ConversationDataSource {
             queue.async {
                 SendMessageService.shared.sendMessage(message: message, ownerUser: ownerUser, isGroupMessage: isGroupMessage)
             }
-        } else if type == .SIGNAL_IMAGE, let image = value as? UIImage {
-            let filename = "\(message.messageId).jpg"
-            let path = MixinFile.chatPhotosUrl.appendingPathComponent(filename)
+        } else if type == .SIGNAL_DATA, let url = value as? URL {
             queue.async {
-                guard image.saveToFile(path: path), FileManager.default.fileSize(path.path) > 0, image.size.width > 0, image.size.height > 0  else {
-                    NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_PHOTO_FAILED)
+                guard FileManager.default.fileSize(url.path) > 0 else {
+                    NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_FILE_FAILED)
                     return
                 }
-                message.thumbImage = image.getBlurThumbnail().toBase64()
-                message.mediaSize = FileManager.default.fileSize(path.path)
-                message.mediaWidth = Int(image.size.width)
-                message.mediaHeight = Int(image.size.height)
-                message.mediaMimeType = "image/jpeg"
-                message.mediaUrl = filename
-                message.mediaStatus = MediaStatus.PENDING.rawValue
-                SendMessageService.shared.sendMessage(message: message, ownerUser: ownerUser, isGroupMessage: isGroupMessage)
-            }
-        } else if type == .SIGNAL_DATA, let url = value as? URL {
-            guard FileManager.default.fileSize(url.path) > 0 else {
-                NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_FILE_FAILED)
-                return
-            }
-            
-            var filename = url.lastPathComponent.substring(endChar: ".").lowercased().md5()
-            var targetUrl = MixinFile.chatFilesUrl.appendingPathComponent("\(filename).\(url.pathExtension)")
-            queue.async {
+                var filename = url.lastPathComponent.substring(endChar: ".").lowercased().md5()
+                var targetUrl = MixinFile.url(ofChatDirectory: .files, filename: "\(filename).\(url.pathExtension)")
                 do {
                     if FileManager.default.fileExists(atPath: targetUrl.path) {
                         if !FileManager.default.compare(path1: url.path, path2: targetUrl.path) {
-                            filename = UUID().uuidString
-                            targetUrl = MixinFile.chatFilesUrl.appendingPathComponent("\(filename).\(url.pathExtension)")
-                            try FileManager.default.copyItem(at: url, to: targetUrl)
+                            filename = UUID().uuidString.lowercased()
+                            targetUrl = MixinFile.url(ofChatDirectory: .videos, filename: "\(filename).\(url.pathExtension)")
+                            try FileManager.default.moveItem(at: url, to: targetUrl)
                         }
                     } else {
-                        try FileManager.default.copyItem(at: url, to: targetUrl)
+                        try FileManager.default.moveItem(at: url, to: targetUrl)
                     }
                 } catch {
                     NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_FILE_FAILED)
@@ -475,19 +457,67 @@ extension ConversationDataSource {
                 }
                 message.name = url.lastPathComponent
                 message.mediaSize = FileManager.default.fileSize(targetUrl.path)
-                message.mediaMimeType = FileManager.default.mimeType(ext: url.pathExtension)
-                message.mediaUrl = "\(filename).\(url.pathExtension)"
+                message.mediaMimeType = FileManager.default.mimeType(ext: targetUrl.pathExtension)
+                message.mediaUrl = "\(filename).\(targetUrl.pathExtension)"
                 message.mediaStatus = MediaStatus.PENDING.rawValue
                 SendMessageService.shared.sendMessage(message: message, ownerUser: ownerUser, isGroupMessage: isGroupMessage)
             }
+        } else if type == .SIGNAL_VIDEO, let value = value as? (URL, AVAsset) {
+            queue.async {
+                let url = value.0
+                let asset = value.1
+                guard asset.duration.isValid, let videoTrack = asset.tracks(withMediaType: .video).first else {
+                    NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_VIDEO_FAILED)
+                    return
+                }
+                let filename = url.lastPathComponent.substring(endChar: ".")
+                let thumbnailFilename = filename + ExtensionName.jpeg.withDot
+                if let thumbnail = UIImage(withFirstFrameOfVideoAtURL: url) {
+                    let thumbnailURL = MixinFile.url(ofChatDirectory: .videos, filename: thumbnailFilename)
+                    thumbnail.saveToFile(path: thumbnailURL)
+                    message.thumbImage = thumbnail.getBlurThumbnail().toBase64()
+                } else {
+                    NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_VIDEO_FAILED)
+                    return
+                }
+                message.mediaDuration = Int64(asset.duration.seconds * millisecondsPerSecond)
+                let size = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
+                message.mediaWidth = Int(abs(size.width))
+                message.mediaHeight = Int(abs(size.height))
+                message.mediaSize = FileManager.default.fileSize(url.path)
+                message.mediaMimeType = FileManager.default.mimeType(ext: url.pathExtension)
+                message.mediaUrl = url.lastPathComponent
+                message.mediaStatus = MediaStatus.PENDING.rawValue
+                SendMessageService.shared.sendMessage(message: message, ownerUser: ownerUser, isGroupMessage: isGroupMessage)
+            }
+        } else if type == .SIGNAL_AUDIO, let value = value as? (tempUrl: URL, metadata: MXNAudioMetadata) {
+            queue.async {
+                guard FileManager.default.fileSize(value.tempUrl.path) > 0 else {
+                    NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_AUDIO_FAILED)
+                    return
+                }
+                let url = MixinFile.url(ofChatDirectory: .audios, filename: UUID().uuidString.lowercased() + ExtensionName.ogg.withDot)
+                do {
+                    try FileManager.default.moveItem(at: value.tempUrl, to: url)
+                    message.mediaSize = FileManager.default.fileSize(url.path)
+                    message.mediaMimeType = FileManager.default.mimeType(ext: url.pathExtension)
+                    message.mediaUrl = url.lastPathComponent
+                    message.mediaStatus = MediaStatus.PENDING.rawValue
+                    message.mediaWaveform = value.metadata.waveform
+                    message.mediaDuration = Int64(value.metadata.duration)
+                    SendMessageService.shared.sendMessage(message: message, ownerUser: ownerUser, isGroupMessage: isGroupMessage)
+                } catch {
+                    NotificationCenter.default.postOnMain(name: .ErrorMessageDidAppear, object: Localized.CHAT_SEND_AUDIO_FAILED)
+                }
+            }
         } else if type == .SIGNAL_STICKER, let sticker = value as? Sticker {
-            message.name = sticker.name
             message.mediaStatus = MediaStatus.PENDING.rawValue
             message.mediaUrl = sticker.assetUrl
-            message.albumId = sticker.albumId
-            let transferData = TransferStickerData(name: sticker.name, albumId: sticker.albumId)
-            message.content = try! JSONEncoder().encode(transferData).base64EncodedString()
+            message.stickerId = sticker.stickerId
             queue.async {
+                let albumId = AlbumDAO.shared.getAlbum(stickerId: sticker.stickerId)?.albumId
+                let transferData = TransferStickerData(stickerId: sticker.stickerId, name: sticker.name, albumId: albumId)
+                message.content = try! JSONEncoder().encode(transferData).base64EncodedString()
                 SendMessageService.shared.sendMessage(message: message, ownerUser: ownerUser, isGroupMessage: isGroupMessage)
             }
         }
@@ -515,15 +545,13 @@ extension ConversationDataSource {
         let initialMessageId = initialMessageId
             ?? highlight?.messageId
             ?? ConversationViewController.positions[conversationId]?.messageId
-        if let initialMessageId = initialMessageId, let offset = MessageDAO.shared.getOffset(conversationId: conversationId, messageId: initialMessageId) {
-            let location = max(0, offset - messagesCountPerPage / 2)
-            messages = MessageDAO.shared.getMessages(conversationId: conversationId, location: location, count: messagesCountPerPage)
+        if let initialMessageId = initialMessageId {
+            messages = MessageDAO.shared.getMessages(conversationId: conversationId, aroundMessageId: initialMessageId, count: messagesCountPerPage)
             if highlight == nil, initialMessageId != firstUnreadMessageId {
                 firstUnreadMessageId = MessageDAO.shared.firstUnreadMessage(conversationId: conversationId)?.messageId
             }
-        } else if let firstUnreadMessageId = MessageDAO.shared.firstUnreadMessage(conversationId: conversationId)?.messageId, let offset = MessageDAO.shared.getOffset(conversationId: conversationId, messageId: firstUnreadMessageId) {
-            let location = max(0, offset - messagesCountPerPage / 2)
-            messages = MessageDAO.shared.getMessages(conversationId: conversationId, location: location, count: messagesCountPerPage)
+        } else if let firstUnreadMessageId = MessageDAO.shared.firstUnreadMessage(conversationId: conversationId)?.messageId {
+            messages = MessageDAO.shared.getMessages(conversationId: conversationId, aroundMessageId: firstUnreadMessageId, count: messagesCountPerPage)
             self.firstUnreadMessageId = firstUnreadMessageId
         } else {
             messages = MessageDAO.shared.getLastNMessages(conversationId: conversationId, count: messagesCountPerPage)
@@ -532,26 +560,14 @@ extension ConversationDataSource {
         }
         loadedMessageIds = Set(messages.map({ $0.messageId }))
         var shouldInsertEncryptionHint = false
-        if messages.count > 0 {
-            if messages.count < messagesCountPerPage {
-                didLoadLatestMessage = true
-            }
-            topMessageOffset = MessageDAO.shared.getOffset(conversationId: conversationId, messageId: messages[0].messageId)
-            bottomMessageOffset = MessageDAO.shared.getOffset(conversationId: conversationId, messageId: messages[messages.count - 1].messageId)
-            if topMessageOffset == 0 {
-                didLoadEarliestMessage = true
-                shouldInsertEncryptionHint = true
-            }
-            if highlight == nil, let firstUnreadMessageId = self.firstUnreadMessageId, let firstUnreadIndex = messages.index(where: { $0.messageId == firstUnreadMessageId }) {
-                let firstUnreadMessge = messages[firstUnreadIndex]
-                let hint = MessageItem.createMessage(category: MessageCategory.EXT_UNREAD.rawValue, conversationId: conversationId, createdAt: firstUnreadMessge.createdAt)
-                messages.insert(hint, at: firstUnreadIndex)
-                self.firstUnreadMessageId = nil
-                canInsertUnreadHint = false
-            }
-        } else {
-            topMessageOffset = nil
-            bottomMessageOffset = nil
+        if messages.count > 0, highlight == nil, let firstUnreadMessageId = self.firstUnreadMessageId, let firstUnreadIndex = messages.index(where: { $0.messageId == firstUnreadMessageId }) {
+            let firstUnreadMessge = messages[firstUnreadIndex]
+            let hint = MessageItem.createMessage(category: MessageCategory.EXT_UNREAD.rawValue, conversationId: conversationId, createdAt: firstUnreadMessge.createdAt)
+            messages.insert(hint, at: firstUnreadIndex)
+            self.firstUnreadMessageId = nil
+            canInsertUnreadHint = false
+        }
+        if messages.count < messagesCountPerPage {
             didLoadEarliestMessage = true
             didLoadLatestMessage = true
             shouldInsertEncryptionHint = true
@@ -683,6 +699,10 @@ extension ConversationDataSource {
                 viewModel = StickerMessageViewModel(message: message, style: style, fits: layoutWidth)
             } else if message.category.hasSuffix("_DATA") {
                 viewModel = DataMessageViewModel(message: message, style: style, fits: layoutWidth)
+            } else if message.category.hasSuffix("_VIDEO") {
+                viewModel = VideoMessageViewModel(message: message, style: style, fits: layoutWidth)
+            } else if message.category.hasSuffix("_AUDIO") {
+                viewModel = AudioMessageViewModel(message: message, style: style, fits: layoutWidth)
             } else if message.category.hasSuffix("_CONTACT") {
                 viewModel = ContactMessageViewModel(message: message, style: style, fits: layoutWidth)
             } else if message.category == MessageCategory.SYSTEM_ACCOUNT_SNAPSHOT.rawValue {
@@ -729,7 +749,7 @@ extension ConversationDataSource {
             || messages[index + 1].isExtensionMessage) {
             style.insert(.hasBottomSeparator)
         }
-        if category == .group && message.userId != me.user_id {
+        if message.isRepresentativeMessage(conversation: conversation) {
             if (isFirstMessage && !message.isExtensionMessage && !message.isSystemMessage)
                 || (!isFirstMessage && (messages[index - 1].userId != message.userId || messages[index - 1].isExtensionMessage || messages[index - 1].isSystemMessage)) {
                 style.insert(.showFullname)
@@ -776,7 +796,7 @@ extension ConversationDataSource {
                     previousViewModel.style.remove(.hasBottomSeparator)
                     previousViewModel.style.remove(.hasTail)
                 }
-                if category == .group && style.contains(.received) && previousViewModelIsFromDifferentUser {
+                if message.isRepresentativeMessage(conversation: conversation) && style.contains(.received) && previousViewModelIsFromDifferentUser {
                     style.insert(.showFullname)
                 }
                 DispatchQueue.main.async {
@@ -794,7 +814,7 @@ extension ConversationDataSource {
                 if viewModel.message.userId != nextViewModel.message.userId {
                     viewModel.style.insert(.hasTail)
                     viewModel.style.insert(.hasBottomSeparator)
-                    if category == .group && nextViewModel.style.contains(.received) {
+                    if nextViewModel.message.isRepresentativeMessage(conversation: conversation) && nextViewModel.style.contains(.received) {
                         nextViewModel.style.insert(.showFullname)
                     }
                 } else {
@@ -817,7 +837,7 @@ extension ConversationDataSource {
             section = dates.index(where: { $0 > date }) ?? dates.count
             row = 0
             isLastCell = section == dates.count
-            if style.contains(.received) && category == .group {
+            if style.contains(.received) && message.isRepresentativeMessage(conversation: conversation) {
                 style.insert(.showFullname)
             }
             viewModel = self.viewModel(withMessage: message, style: style, fits: layoutWidth)

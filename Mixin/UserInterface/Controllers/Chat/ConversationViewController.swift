@@ -1,7 +1,9 @@
 import UIKit
 import MobileCoreServices
+import AVKit
+import Photos
 
-class ConversationViewController: UIViewController {
+class ConversationViewController: UIViewController, StatusBarStyleSwitchableViewController {
     
     @IBOutlet weak var galleryWrapperView: UIView!
     @IBOutlet weak var titleLabel: UILabel!
@@ -11,19 +13,23 @@ class ConversationViewController: UIViewController {
     @IBOutlet weak var scrollToBottomWrapperView: UIView!
     @IBOutlet weak var scrollToBottomButton: UIButton!
     @IBOutlet weak var unreadBadgeLabel: UILabel!
-    @IBOutlet weak var bottomBarWrapperView: UIView!
+    @IBOutlet weak var inputWrapperView: UIView!
     @IBOutlet weak var moreButton: UIButton!
+    @IBOutlet weak var botButton: UIButton!
     @IBOutlet weak var inputTextView: InputTextView!
     @IBOutlet weak var sendButton: UIButton!
-    @IBOutlet weak var toggleStickerPanelButton: UIButton!
+    @IBOutlet weak var toggleStickerPanelSizeButton: UIButton!
+    @IBOutlet weak var stickerKeyboardSwitcherButton: UIButton!
     @IBOutlet weak var avatarImageView: AvatarImageView!
     @IBOutlet weak var participantsLabel: UILabel!
     @IBOutlet weak var unblockButton: StateResponsiveButton!
+    @IBOutlet weak var deleteConversationButton: StateResponsiveButton!
     @IBOutlet weak var stickerPanelContainerView: UIView!
     @IBOutlet weak var moreMenuContainerView: UIView!
-    @IBOutlet weak var dismissMoreMenuButton: UIButton!
+    @IBOutlet weak var dismissPanelsButton: UIButton!
     @IBOutlet weak var loadingView: UIActivityIndicatorView!
     @IBOutlet weak var titleStackView: UIStackView!
+    @IBOutlet weak var audioInputContainerView: UIView!
     
     @IBOutlet weak var scrollToBottomWrapperHeightConstraint: NSLayoutConstraint!
     @IBOutlet weak var inputTextViewHeightConstraint: NSLayoutConstraint!
@@ -31,20 +37,25 @@ class ConversationViewController: UIViewController {
     @IBOutlet weak var stickerPanelContainerHeightConstraint: NSLayoutConstraint!
     @IBOutlet weak var moreMenuHeightConstraint: NSLayoutConstraint!
     @IBOutlet weak var moreMenuTopConstraint: NSLayoutConstraint!
+    @IBOutlet weak var audioInputContainerWidthConstraint: NSLayoutConstraint!
     
     static var positions = [String: Position]()
     
     var dataSource: ConversationDataSource?
+    var statusBarStyle = UIStatusBarStyle.default {
+        didSet {
+            setNeedsStatusBarAppearanceUpdate()
+        }
+    }
     private(set) var conversationId = ""
     
     private let maxInputRow = 6
     private let showScrollToBottomButtonThreshold: CGFloat = 150
     private let loadMoreMessageThreshold = 20
     private let animationDuration: TimeInterval = 0.25
-    private let me = AccountAPI.shared.account!
-    private let keyboardAnimationCurve = UIViewAnimationCurve(rawValue: 7) ?? .easeOut
     private let stickerPanelSegueId = "StickerPanelSegueId"
     private let moreMenuSegueId = "MoreMenuSegueId"
+    private let audioInputSegueId = "AudioInputSegueId"
     
     private var ownerUser: UserItem?
     private var participants = [Participant]()
@@ -54,13 +65,18 @@ class ConversationViewController: UIViewController {
     private var isShowingMenu = false
     private var isShowingStickerPanel = false
     private var isAppearanceAnimating = true
+    private var isStickerPanelMax = false
     private var hideStatusBar = false
+    private var inputWrapperShouldFollowKeyboardPosition = true
+    private var stickerPanelHalfsizedHeight: CGFloat = 320
     
     private var tapRecognizer: UITapGestureRecognizer!
     private var reportRecognizer: UILongPressGestureRecognizer!
     private var stickerPanelViewController: StickerPanelViewController?
     private var moreMenuViewController: ConversationMoreMenuViewController?
+    private var audioInputViewController: AudioInputViewController?
     private var previewDocumentController: UIDocumentInteractionController?
+    private var userBot: App?
     
     private(set) lazy var imagePickerController = ImagePickerController(initialCameraPosition: .rear, cropImageAfterPicked: false, parent: self)
     private lazy var userWindow = UserWindow.instance()
@@ -84,12 +100,20 @@ class ConversationViewController: UIViewController {
         view.addContactButton.addTarget(self, action: #selector(addContactAction(_:)), for: .touchUpInside)
         return view
     }()
-    
+
     private var bottomSafeAreaInset: CGFloat {
         if #available(iOS 11.0, *) {
             return view.safeAreaInsets.bottom
         } else {
             return 0
+        }
+    }
+
+    private var stickerPanelFullsizedHeight: CGFloat {
+        if #available(iOS 11.0, *) {
+            return view.frame.height - 56 - max(view.safeAreaInsets.top, 20) - view.safeAreaInsets.bottom - 55
+        } else {
+            return view.frame.height - 56 - 20 - 55
         }
     }
     
@@ -111,6 +135,10 @@ class ConversationViewController: UIViewController {
         return hideStatusBar
     }
     
+    override var preferredStatusBarStyle: UIStatusBarStyle {
+        return statusBarStyle
+    }
+    
     // MARK: - Life cycle
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -125,6 +153,13 @@ class ConversationViewController: UIViewController {
         } else if let ownerUser = ownerUser {
             titleLabel.text = ownerUser.fullName
         }
+
+        reportRecognizer = UILongPressGestureRecognizer(target: self, action: #selector(showReportMenuAction))
+        reportRecognizer.minimumPressDuration = 2
+        titleLabel.isUserInteractionEnabled = true
+        titleLabel.addGestureRecognizer(reportRecognizer)
+
+        audioInputContainerWidthConstraint.constant = 55
         tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(tapAction(_:)))
         tapRecognizer.delegate = self
         tableView.addGestureRecognizer(tapRecognizer)
@@ -137,11 +172,6 @@ class ConversationViewController: UIViewController {
         inputTextView.layer.cornerRadius = inputTextViewHeightConstraint.constant / 2
         connectionHintView.delegate = self
         loadStickerAndAsset()
-        loadDraft()
-        reportRecognizer = UILongPressGestureRecognizer(target: self, action: #selector(showReportMenuAction))
-        reportRecognizer.minimumPressDuration = 3
-        titleLabel.isUserInteractionEnabled = true
-        titleLabel.addGestureRecognizer(reportRecognizer)
         DispatchQueue.global().async { [weak self] in
             var conversation: ConversationItem?
             if let dataSource = self?.dataSource {
@@ -178,12 +208,72 @@ class ConversationViewController: UIViewController {
             }
         }
     }
-    
+
+    @objc func showReportMenuAction() {
+        guard !self.conversationId.isEmpty else {
+            return
+        }
+
+        let conversationId = self.conversationId
+        let alc = UIAlertController(title: Localized.REPORT_TITLE, message: nil, preferredStyle: .actionSheet)
+        alc.addAction(UIAlertAction(title: Localized.REPORT_BUTTON, style: .default, handler: { [weak self](_) in
+            self?.reportAction(conversationId: conversationId)
+        }))
+        alc.addAction(UIAlertAction(title: Localized.DIALOG_BUTTON_CANCEL, style: .cancel, handler: nil))
+        self.present(alc, animated: true, completion: nil)
+    }
+
+    private func reportAction(conversationId: String) {
+        DispatchQueue.global().async { [weak self] in
+            let developID = AccountAPI.shared.accountIdentityNumber == "762532" ? "31911" : "762532"
+            var user = UserDAO.shared.getUser(identityNumber: developID)
+            if user == nil {
+                switch UserAPI.shared.search(keyword: developID) {
+                    case let .success(userResponse):
+                        UserDAO.shared.updateUsers(users: [userResponse])
+                        user = UserItem.createUser(from: userResponse)
+                    case .failure:
+                       return
+                 }
+            }
+            guard let developUser = user, let url = FileManager.default.exportLog(conversationId: conversationId) else {
+                return
+            }
+            let targetUrl = MixinFile.url(ofChatDirectory: .files, filename: url.lastPathComponent)
+            do {
+                try FileManager.default.copyItem(at: url, to: targetUrl)
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                return
+            }
+            guard FileManager.default.fileSize(targetUrl.path) > 0 else {
+                return
+            }
+
+            let developConversationId = ConversationDAO.shared.makeConversationId(userId: AccountAPI.shared.accountUserId, ownerUserId: developUser.userId)
+            var message = Message.createMessage(category: MessageCategory.SIGNAL_DATA.rawValue, conversationId: developConversationId, userId: AccountAPI.shared.accountUserId)
+            message.name = url.lastPathComponent
+            message.mediaSize = FileManager.default.fileSize(targetUrl.path)
+            message.mediaMimeType = FileManager.default.mimeType(ext: url.pathExtension)
+            message.mediaUrl = url.lastPathComponent
+            message.mediaStatus = MediaStatus.PENDING.rawValue
+
+            self?.dataSource?.queue.async {
+                SendMessageService.shared.sendMessage(message: message, ownerUser: developUser, isGroupMessage: false)
+                DispatchQueue.main.async {
+                    self?.navigationController?.pushViewController(withBackRoot: ConversationViewController.instance(ownerUser: developUser))
+                }
+            }
+        }
+    }
+
     override func prepare(for segue: UIStoryboardSegue, sender: Any?) {
         if segue.identifier == stickerPanelSegueId, let destination = segue.destination as? StickerPanelViewController {
             stickerPanelViewController = destination
         } else if segue.identifier == moreMenuSegueId, let destination = segue.destination as? ConversationMoreMenuViewController {
             moreMenuViewController = destination
+        } else if segue.identifier == audioInputSegueId, let destination = segue.destination as? AudioInputViewController {
+            audioInputViewController = destination
         }
     }
     
@@ -192,6 +282,21 @@ class ConversationViewController: UIViewController {
         super.viewSafeAreaInsetsDidChange()
         if inputWrapperBottomConstraint.constant == 0 {
             inputWrapperBottomConstraint.constant = bottomSafeAreaInset
+        }
+    }
+    
+    override func preferredContentSizeDidChange(forChildContentContainer container: UIContentContainer) {
+        super.preferredContentSizeDidChange(forChildContentContainer: container)
+        if (container as? UIViewController) == audioInputViewController {
+            let isExpanding = container.preferredContentSize.width > audioInputContainerWidthConstraint.constant
+            audioInputContainerWidthConstraint.constant = container.preferredContentSize.width
+            if isExpanding {
+                UIView.animate(withDuration: animationDuration, animations: {
+                    self.view.layoutIfNeeded()
+                })
+            } else {
+                view.layoutIfNeeded()
+            }
         }
     }
     
@@ -214,6 +319,7 @@ class ConversationViewController: UIViewController {
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         saveDraft()
+        MXNAudioPlayer.shared().stop(withAudioSessionDeactivated: true)
         if let visibleIndexPaths = tableView.indexPathsForVisibleRows {
             if let lastIndexPath = dataSource?.lastIndexPath, visibleIndexPaths.contains(lastIndexPath) {
                 ConversationViewController.positions[conversationId] = nil
@@ -241,8 +347,10 @@ class ConversationViewController: UIViewController {
     // MARK: - Actions
     @IBAction func profileAction(_ sender: Any) {
         if let dataSource = dataSource, dataSource.category == .group {
+            groupWindow.bounds.size.width = view.bounds.width
             groupWindow.updateGroup(conversation: dataSource.conversation).presentView()
         } else if let user = ownerUser {
+            userWindow.bounds.size.width = view.bounds.width
             userWindow.updateUser(user: user).presentView()
         }
     }
@@ -279,39 +387,89 @@ class ConversationViewController: UIViewController {
         }
     }
     
-    @IBAction func toggleStickerPanelAction(_ sender: Any) {
-        inputTextView.resignFirstResponder()
+    @IBAction func stickerKeyboardSwitchAction(_ sender: Any) {
         var delay: TimeInterval = 0
         if isShowingMoreMenu {
             toggleMoreMenu(delay: 0)
             delay = animationDuration
         }
-        toggleStickerPanel(delay: delay)
+        if isShowingStickerPanel {
+            inputTextView.becomeFirstResponder()
+        } else {
+            inputWrapperShouldFollowKeyboardPosition = false
+            inputTextView.resignFirstResponder()
+            inputWrapperShouldFollowKeyboardPosition = true
+            toggleStickerPanel(delay: delay)
+        }
+    }
+
+    @IBAction func botAction(_ sender: Any) {
+        guard let user = ownerUser, user.isBot, let app = self.userBot else {
+            return
+        }
+        guard let url = URL(string: app.homeUri), !conversationId.isEmpty else {
+            return
+        }
+
+        if isShowingMoreMenu {
+            toggleMoreMenu(delay: 0)
+        }
+        if isShowingStickerPanel {
+            toggleStickerPanel(delay: 0)
+        }
+        presentWebWindow(withURL: url)
+    }
+    
+    @IBAction func toggleStickerPanelSizeAction(_ sender: Any) {
+        let dismissButtonAlpha: CGFloat
+        if isStickerPanelMax {
+            stickerPanelContainerHeightConstraint.constant = stickerPanelHalfsizedHeight
+            dismissButtonAlpha = 0
+        } else {
+            stickerPanelContainerHeightConstraint.constant = stickerPanelFullsizedHeight
+            dismissButtonAlpha = 0.3
+        }
+        inputWrapperBottomConstraint.constant = stickerPanelContainerHeightConstraint.constant
+        isStickerPanelMax = !isStickerPanelMax
+        toggleStickerPanelSizeButton.animationSwapImage(newImage: isStickerPanelMax ? #imageLiteral(resourceName: "ic_chat_panel_min") : #imageLiteral(resourceName: "ic_chat_panel_max"))
+        UIView.animate(withDuration: animationDuration, animations: {
+            self.dismissPanelsButton.alpha = dismissButtonAlpha
+            self.view.layoutIfNeeded()
+        })
     }
     
     @IBAction func sendTextMessageAction(_ sender: Any) {
+        guard !trimmedMessageDraft.isEmpty else {
+            return
+        }
         dataSource?.sendMessage(type: .SIGNAL_TEXT, value: trimmedMessageDraft)
         inputTextView.text = ""
         textViewDidChange(inputTextView)
     }
     
-    @IBAction func dismissMoreMenuAction(_ sender: Any) {
-        toggleMoreMenu(delay: 0)
+    @IBAction func dismissPanelsAction(_ sender: Any) {
+        if isShowingStickerPanel && isStickerPanelMax {
+            toggleStickerPanel(delay: 0)
+        } else {
+            toggleMoreMenu(delay: 0)
+        }
     }
-    
-    @objc func showReportMenuAction() {
+
+    @IBAction func deleteConversationAction(_ sender: Any) {
         guard !self.conversationId.isEmpty else {
             return
         }
+        deleteConversationButton.isBusy = true
         let conversationId = self.conversationId
-        let alc = UIAlertController(title: Localized.REPORT_TITLE, message: nil, preferredStyle: .actionSheet)
-        alc.addAction(UIAlertAction(title: Localized.REPORT_BUTTON, style: .default, handler: { [weak self](_) in
-            self?.reportAction(conversationId: conversationId)
-        }))
-        alc.addAction(UIAlertAction(title: Localized.DIALOG_BUTTON_CANCEL, style: .cancel, handler: nil))
-        self.present(alc, animated: true, completion: nil)
+        DispatchQueue.global().async { [weak self] in
+            ConversationDAO.shared.makeQuitConversation(conversationId: conversationId)
+            NotificationCenter.default.postOnMain(name: .ConversationDidChange)
+            DispatchQueue.main.async {
+                self?.navigationController?.backToHome()
+            }
+        }
     }
-
+    
     @objc func blockAction(_ sender: Any) {
         guard let userId = ownerUser?.userId else {
             return
@@ -325,45 +483,27 @@ class ConversationViewController: UIViewController {
             switch result {
             case .success(let userResponse):
                 weakSelf.updateOwnerUser(withUserResponse: userResponse, updateDatabase: true)
-            case let .failure(error, didHandled):
-                guard !didHandled else {
-                    return
-                }
-                weakSelf.alert(error.kind.localizedDescription ?? Localized.TOAST_OPERATION_FAILED)
+            case .failure:
+               break
             }
         }
     }
     
     @objc func unblockAction(_ sender: Any) {
-        if !conversationId.isEmpty && unblockButton.title(for: .normal) == Localized.GROUP_MENU_DELETE {
-            unblockButton.isBusy = true
-            let conversationId = self.conversationId
-            DispatchQueue.global().async { [weak self] in
-                ConversationDAO.shared.makeQuitConversation(conversationId: conversationId)
-                NotificationCenter.default.postOnMain(name: .ConversationDidChange)
-                DispatchQueue.main.async {
-                    self?.navigationController?.backToHome()
-                }
-            }
-        } else {
-            guard let user = ownerUser else {
+        guard let user = ownerUser else {
+            return
+        }
+        unblockButton.isBusy = true
+        UserAPI.shared.unblockUser(userId: user.userId) { [weak self] (result) in
+            guard let weakSelf = self else {
                 return
             }
-            unblockButton.isBusy = true
-            UserAPI.shared.unblockUser(userId: user.userId) { [weak self] (result) in
-                guard let weakSelf = self else {
-                    return
-                }
-                weakSelf.unblockButton.isBusy = false
-                switch result {
-                case .success(let userResponse):
-                    weakSelf.updateOwnerUser(withUserResponse: userResponse, updateDatabase: true)
-                case let .failure(error, didHandled):
-                    guard !didHandled else {
-                        return
-                    }
-                    weakSelf.alert(error.kind.localizedDescription ?? Localized.TOAST_OPERATION_FAILED)
-                }
+            weakSelf.unblockButton.isBusy = false
+            switch result {
+            case .success(let userResponse):
+                weakSelf.updateOwnerUser(withUserResponse: userResponse, updateDatabase: true)
+            case .failure:
+                break
             }
         }
     }
@@ -381,16 +521,17 @@ class ConversationViewController: UIViewController {
             switch result {
             case .success(let userResponse):
                 weakSelf.updateOwnerUser(withUserResponse: userResponse, updateDatabase: true)
-            case let .failure(error, didHandled):
-                guard !didHandled else {
-                    return
-                }
-                weakSelf.alert(error.kind.localizedDescription ?? Localized.TOAST_OPERATION_FAILED)
+            case .failure:
+                break
             }
         }
     }
     
     @objc func tapAction(_ recognizer: UIGestureRecognizer) {
+        if let audioInputViewController = audioInputViewController, audioInputViewController.isShowingLongPressHint {
+            audioInputViewController.animateHideLongPressHint()
+            return
+        }
         guard !isShowingMenu else {
             dismissMenu(animated: true)
             return
@@ -403,34 +544,46 @@ class ConversationViewController: UIViewController {
             toggleStickerPanel(delay: 0)
             return
         }
-        guard let indexPath = tableView.indexPathForRow(at: recognizer.location(in: tableView)), let cell = tableView.cellForRow(at: indexPath), let message = dataSource?.viewModel(for: indexPath)?.message else {
+        guard let indexPath = tableView.indexPathForRow(at: recognizer.location(in: tableView)), let cell = tableView.cellForRow(at: indexPath), let viewModel = dataSource?.viewModel(for: indexPath) else {
             return
         }
-        if message.category.hasSuffix("_IMAGE") {
-            guard message.mediaStatus == MediaStatus.DONE.rawValue, let photoCell = cell as? PhotoMessageCell, photoCell.contentImageView.frame.contains(recognizer.location(in: photoCell)), let item = GalleryItem(message: message) else {
+        let message = viewModel.message
+        if message.category.hasSuffix("_IMAGE") || message.category.hasSuffix("_VIDEO") {
+            guard message.mediaStatus == MediaStatus.DONE.rawValue, let cell = cell as? PhotoRepresentableMessageCell, cell.contentImageView.frame.contains(recognizer.location(in: cell)), let item = GalleryItem(message: message) else {
                 return
             }
+            MXNAudioPlayer.shared().stop(withAudioSessionDeactivated: true)
             view.bringSubview(toFront: galleryWrapperView)
             galleryViewController.show(item: item)
-        } else if message.category.hasSuffix("_DATA") {
-            guard let dataCell = cell as? DataMessageCell, dataCell.contentFrame.contains(recognizer.location(in: dataCell)), let mediaStatus = message.mediaStatus else {
+        } else if message.category.hasSuffix("_AUDIO") {
+            guard message.mediaStatus == MediaStatus.DONE.rawValue, let cell = cell as? AudioMessageCell else {
                 return
             }
-            
-            switch mediaStatus {
-            case MediaStatus.DONE.rawValue:
-                openDocumentAction(message: message)
-            case MediaStatus.CANCELED.rawValue:
-                MessageDAO.shared.updateMediaStatus(messageId: message.messageId, status: .PENDING, conversationId: message.conversationId)
-                if message.userId == me.user_id {
-                    FileJobQueue.shared.addJob(job: FileUploadJob(message: Message.createMessage(message: message)))
-                } else {
-                    FileJobQueue.shared.addJob(job: FileDownloadJob(message: Message.createMessage(message: message)))
+            let cellIsPlaying = cell.isPlaying
+            MXNAudioPlayer.shared().stop(withAudioSessionDeactivated: cellIsPlaying)
+            if !cellIsPlaying {
+                cell.isPlaying = true
+                if let mediaUrl = viewModel.message.mediaUrl {
+                    let path = MixinFile.url(ofChatDirectory: .audios, filename: mediaUrl).path
+                    MXNAudioPlayer.shared().playFile(atPath: path) { [weak cell] (success, error) in
+                        if let error = error as? MXNAudioPlayerError, error == .cancelled {
+                            DispatchQueue.main.async {
+                                cell?.isPlaying = false
+                            }
+                        } else if let error = error {
+                            UIApplication.trackError("ConversationViewController", action: "Play audio", userInfo: ["error": error])
+                        }
+                    }
                 }
-            case MediaStatus.PENDING.rawValue:
-                cancelMessageSending(message: message)
-            default:
-                break
+            }
+        } else if message.category.hasSuffix("_DATA") {
+            guard let viewModel = viewModel as? DataMessageViewModel, let cell = cell as? DataMessageCell else {
+                return
+            }
+            if viewModel.mediaStatus == MediaStatus.DONE.rawValue {
+                openDocumentAction(message: message)
+            } else {
+                attachmentLoadingCellDidSelectNetworkOperation(cell)
             }
         } else if message.category.hasSuffix("_CONTACT") {
             guard let cell = cell as? ContactMessageCell, cell.contentFrame.contains(recognizer.location(in: cell)) else {
@@ -505,18 +658,29 @@ class ConversationViewController: UIViewController {
     }
     
     @objc func keyboardWillChangeFrame(_ notification: Notification) {
-        guard !isAppearanceAnimating else {
+        guard !isAppearanceAnimating && inputWrapperShouldFollowKeyboardPosition else {
             return
         }
         let endFrame: CGRect = (notification.userInfo?[UIKeyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue ?? .zero
+        stickerPanelHalfsizedHeight = endFrame.height
         let duration = notification.userInfo?[UIKeyboardAnimationDurationUserInfoKey] as? TimeInterval ?? animationDuration
         let windowHeight = AppDelegate.current.window!.bounds.height
         inputWrapperBottomConstraint.constant = max(windowHeight - endFrame.origin.y, bottomSafeAreaInset)
         let inputWrapperDisplacement = lastInputWrapperBottomConstant - inputWrapperBottomConstraint.constant
         let keyboardIsMovingUp = inputWrapperBottomConstraint.constant > 0
+        var shouldHideStickerPanel = false
         if isShowingStickerPanel && keyboardIsMovingUp {
-            stickerPanelContainerView.alpha = 0
             isShowingStickerPanel = false
+            toggleStickerPanelSizeButton.isHidden = true
+            stickerKeyboardSwitcherButton.setImage(#imageLiteral(resourceName: "ic_chat_sticker"), for: .normal)
+            shouldHideStickerPanel = true
+        }
+        if keyboardIsMovingUp {
+            if inputTextView.hasText {
+                sendButton.isHidden = false
+            } else {
+                audioInputContainerView.isHidden = false
+            }
         }
         if isShowingMoreMenu {
             toggleMoreMenu(delay: 0)
@@ -524,8 +688,8 @@ class ConversationViewController: UIViewController {
         let y = max(0, tableView.contentOffset.y - inputWrapperDisplacement)
         lastInputWrapperBottomConstant = inputWrapperBottomConstraint.constant
         UIView.animate(withDuration: duration) {
-            if let rawValue = notification.userInfo?[UIKeyboardAnimationCurveUserInfoKey] as? Int, let curve = UIViewAnimationCurve(rawValue: rawValue) {
-                UIView.setAnimationCurve(curve)
+            if shouldHideStickerPanel {
+                self.stickerPanelContainerView.alpha = 0
             }
             self.tableView.contentOffset.y = y
             self.view.layoutIfNeeded()
@@ -577,8 +741,8 @@ class ConversationViewController: UIViewController {
             dismissButtonAlpha = 0.3
         }
         UIView.animate(withDuration: animationDuration, delay: delay, options: [], animations: {
-            UIView.setAnimationCurve(self.keyboardAnimationCurve)
-            self.dismissMoreMenuButton.alpha = dismissButtonAlpha
+            UIView.setAnimationCurve(.overdamped)
+            self.dismissPanelsButton.alpha = dismissButtonAlpha
             self.view.layoutIfNeeded()
         }, completion: nil)
     }
@@ -607,6 +771,29 @@ class ConversationViewController: UIViewController {
         navigationController?.pushViewController(ConversationShareContactViewController.instance(ownerUser: ownerUser, conversationId: conversationId), animated: true)
     }
 
+    func pickPhotoOrVideoAction() {
+        PHPhotoLibrary.checkAuthorization { [weak self](authorized) in
+            guard authorized, let weakSelf = self else {
+                return
+            }
+            let picker = PhotoAssetPickerNavigationController.instance(pickerDelegate: weakSelf)
+            weakSelf.present(picker, animated: true, completion: nil)
+        }
+    }
+
+    func reduceStickerPanelHeightIfMaximized() {
+        guard isStickerPanelMax else {
+            return
+        }
+        toggleStickerPanelSizeAction(self)
+    }
+    
+    func setInputWrapperHidden(_ hidden: Bool) {
+        UIView.animate(withDuration: animationDuration) {
+            self.inputWrapperView.alpha = hidden ? 0 : 1
+        }
+    }
+    
     // MARK: - Class func
     class func instance(conversation: ConversationItem, highlight: ConversationDataSource.Highlight? = nil) -> ConversationViewController {
         let vc = Storyboard.chat.instantiateViewController(withIdentifier: "conversation") as! ConversationViewController
@@ -651,10 +838,12 @@ extension ConversationViewController: UITextViewDelegate {
         inputTextView.isScrollEnabled = contentSize.height > maxHeight
         if trimmedMessageDraft.isEmpty {
             sendButton.isHidden = true
-            toggleStickerPanelButton.isHidden = false
+            audioInputContainerView.isHidden = false
+            stickerKeyboardSwitcherButton.isHidden = false
         } else {
             sendButton.isHidden = false
-            toggleStickerPanelButton.isHidden = true
+            audioInputContainerView.isHidden = true
+            stickerKeyboardSwitcherButton.isHidden = true
         }
         let newHeight = min(contentSize.height, maxHeight)
         if abs(newHeight - inputTextViewHeightConstraint.constant) > 0.1 {
@@ -731,16 +920,17 @@ extension ConversationViewController: ConversationTableViewActionDelegate {
     }
     
     func conversationTableView(_ tableView: ConversationTableView, didSelectAction action: ConversationTableView.Action, forIndexPath indexPath: IndexPath) {
-        guard let message = dataSource?.viewModel(for: indexPath)?.message else {
+        guard let viewModel = dataSource?.viewModel(for: indexPath) else {
             return
         }
+        let message = viewModel.message
         switch action {
         case .copy:
             if message.category.hasSuffix("_TEXT") {
                 UIPasteboard.general.string = message.content
             }
         case .delete:
-            cancelMessageSending(message: message)
+            (viewModel as? AttachmentLoadingViewModel)?.cancelAttachmentLoading(markMediaStatusCancelled: false)
             dataSource?.queue.async { [weak self] in
                 MessageDAO.shared.deleteMessage(id: message.messageId)
                 DispatchQueue.main.sync {
@@ -761,6 +951,22 @@ extension ConversationViewController: ConversationTableViewActionDelegate {
             navigationController?.pushViewController(ForwardViewController.instance(message: message, ownerUser: ownerUser), animated: true)
         case .reply:
             break
+        case .add:
+            if message.category.hasSuffix("_STICKER"), let stickerId = message.stickerId {
+                StickerAPI.shared.addSticker(stickerId: stickerId, completion: { (result) in
+                    switch result {
+                    case let .success(sticker):
+                        DispatchQueue.global().async {
+                            StickerDAO.shared.insertOrUpdateFavoriteSticker(sticker: sticker)
+                            NotificationCenter.default.postOnMain(name: .ToastMessageDidAppear, object: Localized.TOAST_ADDED)
+                        }
+                    case .failure:
+                        break
+                    }
+                })
+            } else {
+                navigationController?.pushViewController(StickerAddViewController.instance(message: message), animated: true)
+            }
         }
     }
 }
@@ -817,8 +1023,17 @@ extension ConversationViewController: UITableViewDelegate {
             unreadBadgeValue = 0
             dataSource.firstUnreadMessageId = nil
         }
+        if let viewModel = dataSource.viewModel(for: indexPath) as? AttachmentLoadingViewModel, viewModel.automaticallyLoadsAttachment {
+            viewModel.beginAttachmentLoading()
+        }
     }
     
+    func tableView(_ tableView: UITableView, didEndDisplaying cell: UITableViewCell, forRowAt indexPath: IndexPath) {
+        if let viewModel = dataSource?.viewModel(for: indexPath) as? AttachmentLoadingViewModel, viewModel.automaticallyLoadsAttachment {
+            viewModel.cancelAttachmentLoading(markMediaStatusCancelled: false)
+        }
+    }
+
     func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
         guard let viewModel = dataSource?.viewModel(for: indexPath) else {
             return 44
@@ -876,63 +1091,33 @@ extension ConversationViewController: AppButtonGroupMessageCellDelegate {
     
 }
 
-// MARK: - DataMessageCellDelegate
-extension ConversationViewController: DataMessageCellDelegate {
+// MARK: - AttachmentLoadingMessageCellDelegate
+extension ConversationViewController: AttachmentLoadingMessageCellDelegate {
     
-    func dataMessageCellDidSelectNetworkOperation(_ cell: DataMessageCell) {
-        guard let indexPath = tableView.indexPath(for: cell), let viewModel = dataSource?.viewModel(for: indexPath) else {
+    func attachmentLoadingCellDidSelectNetworkOperation(_ cell: MessageCell & AttachmentLoadingMessageCell) {
+        guard let indexPath = tableView.indexPath(for: cell), let viewModel = dataSource?.viewModel(for: indexPath) as? MessageViewModel & AttachmentLoadingViewModel, let mediaStatus = viewModel.mediaStatus else {
             return
         }
-        let message = viewModel.message
-        operationAction(message: message, operationButton: cell.operationButton)
-    }
-    
-}
-
-// MARK: - PhotoMessageCellDelegate
-extension ConversationViewController: PhotoMessageCellDelegate {
-    
-    func photoMessageCellDidSelectNetworkOperation(_ cell: PhotoMessageCell) {
-        guard let indexPath = tableView.indexPath(for: cell), let viewModel = dataSource?.viewModel(for: indexPath) else {
-            return
-        }
-        let message = viewModel.message
-        if case .download = cell.operationButton.style {
-            cell.downloadPhoto(message: message)
-        }
-        operationAction(message: message, operationButton: cell.operationButton)
-    }
-    
-    private func operationAction(message: MessageItem, operationButton: NetworkOperationButton) {
-        switch operationButton.style {
-        case .finished, .expired:
+        switch mediaStatus {
+        case MediaStatus.CANCELED.rawValue:
+            viewModel.beginAttachmentLoading()
+        case MediaStatus.PENDING.rawValue:
+            viewModel.cancelAttachmentLoading(markMediaStatusCancelled: true)
+        default:
             break
-        case .upload:
-            MessageDAO.shared.updateMediaStatus(messageId: message.messageId, status: .PENDING, conversationId: message.conversationId)
-            if message.category.hasSuffix("_DATA") {
-                FileJobQueue.shared.addJob(job: FileUploadJob(message: Message.createMessage(message: message)))
-            } else if message.category.hasSuffix("_IMAGE") {
-                ConcurrentJobQueue.shared.addJob(job: AttachmentUploadJob(message: Message.createMessage(message: message)))
-            }
-        case .download:
-            MessageDAO.shared.updateMediaStatus(messageId: message.messageId, status: .PENDING, conversationId: message.conversationId)
-            if message.category.hasSuffix("_DATA") {
-                FileJobQueue.shared.addJob(job: FileDownloadJob(message: Message.createMessage(message: message)))
-            }
-        case .busy:
-            cancelMessageSending(message: message)
         }
     }
+    
 }
 
-// MARK: - TextMessageLabelDelegate
-extension ConversationViewController: TextMessageLabelDelegate {
+// MARK: - CoreTextLabelDelegate
+extension ConversationViewController: CoreTextLabelDelegate {
     
-    func textMessageLabel(_ label: TextMessageLabel, didSelectURL url: URL) {
+    func coreTextLabel(_ label: CoreTextLabel, didSelectURL url: URL) {
         open(url: url)
     }
     
-    func textMessageLabel(_ label: TextMessageLabel, didLongPressOnURL url: URL) {
+    func coreTextLabel(_ label: CoreTextLabel, didLongPressOnURL url: URL) {
         let alert = UIAlertController(title: url.absoluteString, message: nil, preferredStyle: .actionSheet)
         alert.addAction(UIAlertAction(title: Localized.CHAT_MESSAGE_OPEN_URL, style: .default, handler: { [weak self](_) in
             self?.open(url: url)
@@ -951,7 +1136,7 @@ extension ConversationViewController: TextMessageLabelDelegate {
 extension ConversationViewController: ImagePickerControllerDelegate {
     
     func imagePickerController(_ controller: ImagePickerController, didPickImage image: UIImage) {
-        let previewViewController = PhotoSendViewController.instance(image: image, dataSource: dataSource)
+        let previewViewController = AssetSendViewController.instance(image: image, dataSource: dataSource)
         navigationController?.pushViewController(previewViewController, animated: true)
     }
     
@@ -992,7 +1177,7 @@ extension ConversationViewController: UIDocumentInteractionControllerDelegate {
 extension ConversationViewController: GalleryViewControllerDelegate {
     
     func galleryViewController(_ viewController: GalleryViewController, placeholderForItemOfMessageId id: String) -> UIImage? {
-        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }), let cell = tableView.cellForRow(at: indexPath) as? PhotoMessageCell {
+        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }), let cell = tableView.cellForRow(at: indexPath) as? PhotoRepresentableMessageCell {
             return cell.contentImageView.image
         } else {
             return nil
@@ -1000,7 +1185,7 @@ extension ConversationViewController: GalleryViewControllerDelegate {
     }
     
     func galleryViewController(_ viewController: GalleryViewController, sourceRectForItemOfMessageId id: String) -> CGRect? {
-        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }), let cell = tableView.cellForRow(at: indexPath) as? PhotoMessageCell {
+        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }), let cell = tableView.cellForRow(at: indexPath) as? PhotoRepresentableMessageCell {
             return cell.contentImageView.convert(cell.contentImageView.bounds, to: view)
         } else {
             return nil
@@ -1009,12 +1194,20 @@ extension ConversationViewController: GalleryViewControllerDelegate {
     
     func galleryViewController(_ viewController: GalleryViewController, transition: GalleryViewController.Transition, stateDidChangeTo state: GalleryViewController.TransitionState, forItemOfMessageId id: String?) {
         var contentViews = [UIView]()
-        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }), let cell = tableView.cellForRow(at: indexPath) as? PhotoMessageCell {
-            contentViews = [cell.contentImageView,
-                            cell.shadowImageView,
-                            cell.operationButton,
-                            cell.timeLabel,
-                            cell.statusImageView]
+        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }) {
+            let cell = tableView.cellForRow(at: indexPath)
+            if let cell = cell as? PhotoRepresentableMessageCell {
+                contentViews = [cell.contentImageView,
+                                cell.shadowImageView,
+                                cell.timeLabel,
+                                cell.statusImageView]
+            }
+            if let cell = cell as? AttachmentExpirationHintingMessageCell {
+                contentViews.append(cell.operationButton)
+            }
+            if let cell = cell as? VideoMessageCell {
+                contentViews.append(cell.lengthLabel)
+            }
         }
         switch state {
         case .began:
@@ -1034,7 +1227,7 @@ extension ConversationViewController: GalleryViewControllerDelegate {
     }
     
     func galleryViewController(_ viewController: GalleryViewController, snapshotForItemOfMessageId id: String) -> UIView? {
-        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }), let cell = tableView.cellForRow(at: indexPath) as? PhotoMessageCell {
+        if let indexPath = dataSource?.indexPath(where: { $0.messageId == id }), let cell = tableView.cellForRow(at: indexPath) as? PhotoRepresentableMessageCell {
             return cell.contentSnapshotView(afterScreenUpdates: false)
         } else {
             return nil
@@ -1049,6 +1242,15 @@ extension ConversationViewController: GalleryViewControllerDelegate {
             hideStatusBar = false
         }
         setNeedsStatusBarAppearanceUpdate()
+    }
+    
+}
+
+// MARK: - PhotoAssetPickerDelegate
+extension ConversationViewController: PhotoAssetPickerDelegate {
+
+    func pickerController(_ picker: PickerViewController, contentOffset: CGPoint, didFinishPickingMediaWithAsset asset: PHAsset) {
+        navigationController?.pushViewController(AssetSendViewController.instance(asset: asset, dataSource: dataSource), animated: true)
     }
     
 }
@@ -1085,11 +1287,16 @@ extension ConversationViewController {
         guard let user = ownerUser else {
             return
         }
-        unblockButton.isHidden = user.relationship != Relationship.BLOCKING.rawValue
+        let isBlocked = user.relationship == Relationship.BLOCKING.rawValue
+        unblockButton.isHidden = !isBlocked
+        audioInputContainerView.isHidden = isBlocked
+        botButton.isHidden = !user.isBot
     }
     
     private func updateMoreMenuFixedJobs() {
         if dataSource?.category == .contact, let ownerUser = ownerUser, !ownerUser.isBot {
+            moreMenuViewController?.fixedJobs = [.transfer, .camera, .photo, .file, .contact]
+        } else if let userBot = userBot, userBot.creatorId == AccountAPI.shared.accountUserId {
             moreMenuViewController?.fixedJobs = [.transfer, .camera, .photo, .file, .contact]
         } else {
             moreMenuViewController?.fixedJobs = [.camera, .photo, .file, .contact]
@@ -1108,7 +1315,7 @@ extension ConversationViewController {
                 guard let ownerId = ownerUser?.userId, let userBot = AppDAO.shared.getUserBot(userId: ownerId) else {
                     return
                 }
-                moreMenuViewController?.apps = [userBot]
+                self.userBot = userBot
             }
         }
     }
@@ -1150,13 +1357,22 @@ extension ConversationViewController {
     }
     
     private func toggleStickerPanel(delay: TimeInterval) {
+        stickerPanelContainerHeightConstraint.constant = stickerPanelHalfsizedHeight
         inputWrapperBottomConstraint.constant = isShowingStickerPanel ? bottomSafeAreaInset : stickerPanelContainerHeightConstraint.constant
         let newAlpha: CGFloat = isShowingStickerPanel ? 0 : 1
+        stickerKeyboardSwitcherButton.setImage(isShowingStickerPanel ? #imageLiteral(resourceName: "ic_chat_sticker") : #imageLiteral(resourceName: "ic_chat_keyboard"), for: .normal)
+        sendButton.isHidden = !isShowingStickerPanel || !inputTextView.hasText
+        toggleStickerPanelSizeButton.isHidden = isShowingStickerPanel
+        isStickerPanelMax = false
+        toggleStickerPanelSizeButton.setImage(#imageLiteral(resourceName: "ic_chat_panel_max"), for: .normal)
         let offset = inputWrapperBottomConstraint.constant - lastInputWrapperBottomConstant
-        UIView.animate(withDuration: animationDuration, delay: delay, options: [], animations: {
-            UIView.setAnimationCurve(self.keyboardAnimationCurve)
-            self.stickerPanelContainerView.alpha = newAlpha
+        UIView.animate(withDuration: animationDuration, delay: delay, options: .curveEaseOut, animations: {
             self.tableView.contentOffset.y = max(0, self.tableView.contentOffset.y + offset)
+            self.stickerPanelContainerView.alpha = newAlpha
+            self.audioInputContainerView.isHidden = !self.isShowingStickerPanel
+            if self.isShowingStickerPanel {
+                self.dismissPanelsButton.alpha = 0
+            }
             self.view.layoutIfNeeded()
         }) { (_) in
             self.isShowingStickerPanel = !self.isShowingStickerPanel
@@ -1232,7 +1448,8 @@ extension ConversationViewController {
         updateMoreMenuApps()
         updateStrangerTipsView()
         updateBottomView()
-        bottomBarWrapperView.isHidden = false
+        inputWrapperView.isHidden = false
+        loadDraft()
         updateNavigationBar()
         reloadParticipants()
         NotificationCenter.default.addObserver(self, selector: #selector(conversationDidChange(_:)), name: .ConversationDidChange, object: nil)
@@ -1279,6 +1496,8 @@ extension ConversationViewController {
                         return
                     }
                     weakSelf.unblockButton.isHidden = true
+                    weakSelf.deleteConversationButton.isHidden = true
+                    weakSelf.audioInputContainerView.isHidden = false
                     if weakSelf.dataSource?.category == .group {
                         weakSelf.participantsLabel.text = Localized.GROUP_SECTION_TITLE_MEMBERS(count: weakSelf.participants.count)
                     }
@@ -1289,8 +1508,8 @@ extension ConversationViewController {
                         return
                     }
                     weakSelf.participantsLabel.text = Localized.GROUP_REMOVE_TITLE
-                    weakSelf.unblockButton.setTitle(Localized.GROUP_MENU_DELETE, for: .normal)
-                    weakSelf.unblockButton.isHidden = false
+                    weakSelf.deleteConversationButton.isHidden = false
+                    weakSelf.audioInputContainerView.isHidden = true
                 }
             }
         }
@@ -1299,10 +1518,11 @@ extension ConversationViewController {
     private func loadStickerAndAsset() {
         let containerWidth = AppDelegate.current.window!.bounds.width
         DispatchQueue.global().async { [weak self] in
-            let albums = StickerAlbumDAO.shared.getAlbums()
+            let albums = AlbumDAO.shared.getAlbums()
             var stickers = albums.map{ StickerDAO.shared.getStickers(albumId: $0.albumId) }
             let limit = StickerPageViewController.numberOfRecentStickers(forLayoutWidth: containerWidth)
             stickers.insert(StickerDAO.shared.recentUsedStickers(limit: limit), at: 0)
+            stickers.insert(StickerDAO.shared.getFavoriteStickers(), at: 1)
             DispatchQueue.main.async {
                 self?.stickerPanelViewController?.reload(albums: albums, stickers: stickers)
             }
@@ -1315,7 +1535,7 @@ extension ConversationViewController {
         guard let mediaUrl = message.mediaUrl else {
             return
         }
-        let url = MixinFile.chatFilesUrl.appendingPathComponent(mediaUrl)
+        let url = MixinFile.url(ofChatDirectory: .files, filename: mediaUrl)
         guard FileManager.default.fileExists(atPath: url.path)  else {
             UIApplication.trackError("ConversationViewController", action: "openDocumentAction file not exist")
             return
@@ -1324,73 +1544,6 @@ extension ConversationViewController {
         previewDocumentController?.delegate = self
         if !(previewDocumentController?.presentPreview(animated: true) ?? false) {
             previewDocumentController?.presentOpenInMenu(from: CGRect.zero, in: self.view, animated: true)
-        }
-    }
-    
-    private func cancelMessageSending(message: MessageItem) {
-        let sentByMe = message.userId == me.user_id
-        let jobId: String
-        if message.category.hasSuffix("_IMAGE") {
-            if sentByMe {
-                jobId = AttachmentUploadJob.jobId(messageId: message.messageId)
-            } else {
-                jobId = AttachmentDownloadJob.jobId(messageId: message.messageId)
-            }
-            ConcurrentJobQueue.shared.cancelJob(jobId: jobId)
-        } else if message.category.hasSuffix("_DATA") {
-            if sentByMe {
-                jobId = FileUploadJob.fileJobId(messageId: message.messageId)
-            } else {
-                jobId = FileDownloadJob.fileJobId(messageId: message.messageId)
-            }
-            FileJobQueue.shared.cancelJob(jobId: jobId)
-        } else {
-            return
-        }
-        MessageDAO.shared.updateMediaStatus(messageId: message.messageId, status: .CANCELED, conversationId: message.conversationId)
-    }
-    
-    private func reportAction(conversationId: String) {
-        DispatchQueue.global().async { [weak self] in
-            let developID = AccountAPI.shared.accountIdentityNumber == "762532" ? "31911" : "762532"
-            var user = UserDAO.shared.getUser(identityNumber: developID)
-            if user == nil {
-                switch UserAPI.shared.search(keyword: developID) {
-                case let .success(userResponse):
-                    UserDAO.shared.updateUsers(users: [userResponse])
-                    user = UserItem.createUser(from: userResponse)
-                case .failure:
-                    return
-                }
-            }
-            guard let developUser = user, let url = FileManager.default.exportLog(conversationId: conversationId) else {
-                return
-            }
-            let targetUrl = MixinFile.chatFilesUrl.appendingPathComponent(url.lastPathComponent)
-            do {
-                try FileManager.default.copyItem(at: url, to: targetUrl)
-                try FileManager.default.removeItem(at: url)
-            } catch {
-                return
-            }
-            guard FileManager.default.fileSize(targetUrl.path) > 0 else {
-                return
-            }
-            
-            let developConversationId = ConversationDAO.shared.makeConversationId(userId: AccountAPI.shared.accountUserId, ownerUserId: developUser.userId)
-            var message = Message.createMessage(category: MessageCategory.SIGNAL_DATA.rawValue, conversationId: developConversationId, userId: AccountAPI.shared.accountUserId)
-            message.name = url.lastPathComponent
-            message.mediaSize = FileManager.default.fileSize(targetUrl.path)
-            message.mediaMimeType = FileManager.default.mimeType(ext: url.pathExtension)
-            message.mediaUrl = url.lastPathComponent
-            message.mediaStatus = MediaStatus.PENDING.rawValue
-            
-            self?.dataSource?.queue.async {
-                SendMessageService.shared.sendMessage(message: message, ownerUser: developUser, isGroupMessage: false)
-                DispatchQueue.main.async {
-                    self?.navigationController?.pushViewController(withBackRoot: ConversationViewController.instance(ownerUser: developUser))
-                }
-            }
         }
     }
 
@@ -1413,7 +1566,13 @@ extension ConversationViewController {
         guard !conversationId.isEmpty else {
             return
         }
-        WebWindow.instance(conversationId: conversationId).presentPopupControllerAnimated(url: url)
+        presentWebWindow(withURL: url)
+    }
+    
+    private func presentWebWindow(withURL url: URL) {
+        let window = WebWindow.instance(conversationId: conversationId)
+        window.controller = self
+        window.presentPopupControllerAnimated(url: url)
     }
     
 }

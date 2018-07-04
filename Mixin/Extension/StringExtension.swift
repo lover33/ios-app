@@ -1,5 +1,6 @@
-import Foundation
+import UIKit
 import Goutils
+import CoreText
 
 extension String {
 
@@ -61,8 +62,9 @@ extension String {
         return String(self[startIndex ..< endIndex])
     }
 
-    func isNumeric() -> Bool {
-        return Double(self) != nil
+    var isNumeric: Bool {
+        let number = NumberFormatter.decimal.number(from: self)
+        return number != nil
     }
 
     public func toInt() -> Int {
@@ -116,7 +118,7 @@ extension String {
 
     func formatSimpleBalance() -> String {
         let formatter = NumberFormatter(numberStyle: .decimal)
-        if hasPrefix("0.") {
+        if hasPrefix("0.") || hasPrefix("-0.") {
             formatter.maximumFractionDigits = 8
         } else if let dotIdx = index(of: ".") {
             formatter.maximumFractionDigits = 8 - dotIdx.encodedOffset
@@ -124,8 +126,27 @@ extension String {
         return formatter.string(from: NSDecimalNumber(string: self)) ?? self
     }
 
+    func formatBalance() -> String {
+        return NumberFormatter(numberStyle: .decimal).string(from: NSDecimalNumber(string: self)) ?? self
+    }
+
     func formatFullBalance() -> String {
         return NumberFormatter.balanceFormatter.string(from: NSDecimalNumber(string: self)) ?? self
     }
+}
+
+extension NSAttributedStringKey {
+    static let ctFont = kCTFontAttributeName as NSAttributedStringKey
+    static let ctForegroundColor = kCTForegroundColorAttributeName as NSAttributedStringKey
+    static let ctParagraphStyle = kCTParagraphStyleAttributeName as NSAttributedStringKey
+}
+
+extension NSMutableAttributedString {
+    
+    func setCTForegroundColor(_ color: UIColor, for range: NSRange) {
+        removeAttribute(.ctForegroundColor, range: range)
+        addAttributes([.ctForegroundColor: color.cgColor], range: range)
+    }
+    
 }
 

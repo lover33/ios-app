@@ -1,6 +1,7 @@
 import Foundation
 import Bugsnag
 import UIKit
+import FLAnimatedImage
 
 class ReceiveMessageService: MixinService {
 
@@ -32,15 +33,10 @@ class ReceiveMessageService: MixinService {
                 if data.userId == AccountAPI.shared.accountUserId && data.category.isEmpty {
                     MessageDAO.shared.updateMessageStatus(messageId: data.messageId, status: data.status)
                 } else {
-                    var success = false
-                    defer {
-                        FileManager.default.writeLog(conversationId: data.conversationId, log: "[Receive][\(data.category)]...\(data.messageId)...\(data.createdAt)...insertOrReplace:\(success)")
-                    }
                     guard BlazeMessageDAO.shared.insertOrReplace(messageId: data.messageId, data: blazeMessage.data, createdAt: data.createdAt) else {
                         UIApplication.trackError("ReceiveMessageService", action: "receiveMessage insert failed")
                         return
                     }
-                    success = true
                     ReceiveMessageService.shared.processReceiveMessages()
                 }
             }
@@ -95,6 +91,7 @@ class ReceiveMessageService: MixinService {
         guard data.category.hasPrefix("SIGNAL_") else {
             return
         }
+
         let username = UserDAO.shared.getUser(userId: data.userId)?.fullName ?? data.userId
 
         if data.category == MessageCategory.SIGNAL_KEY.rawValue {
@@ -119,7 +116,7 @@ class ReceiveMessageService: MixinService {
                 }
             })
             let status = SignalProtocol.shared.getRatchetSenderKeyStatus(groupId: data.conversationId, senderId: data.userId)
-            FileManager.default.writeLog(conversationId: data.conversationId, log: "[ProcessSignalMessage][\(username)][\(data.category)]...decrypt success...messageId:\(data.messageId)...\(data.createdAt)...status:\(status)...source:\(data.source)...redecryptMessage:\(decoded.resendMessageId != nil)")
+            FileManager.default.writeLog(conversationId: data.conversationId, log: "[ProcessSignalMessage][\(username)][\(data.category)]...decrypt success...messageId:\(data.messageId)...\(data.createdAt)...status:\(status ?? "")...source:\(data.source)...resendMessageId:\(decoded.resendMessageId ?? "")")
             if status == RatchetStatus.REQUESTING.rawValue {
                 SignalProtocol.shared.deleteRatchetSenderKey(groupId: data.conversationId, senderId: data.userId)
                 self.requestResendMessage(conversationId: data.conversationId, userId: data.userId)
@@ -127,15 +124,19 @@ class ReceiveMessageService: MixinService {
         } catch {
             trackDecryptFailed(data: data, dataHeader: decoded, error: error)
             FileManager.default.writeLog(conversationId: data.conversationId, log: "[ProcessSignalMessage][\(username)][\(data.category)][\(CiphertextMessage.MessageType.toString(rawValue: decoded.keyType))]...decrypt failed...\(error)...messageId:\(data.messageId)...\(data.createdAt)...source:\(data.source)...resendMessageId:\(decoded.resendMessageId ?? "")")
+            guard !MessageDAO.shared.isExist(messageId: data.messageId) else {
+                UIApplication.trackError("ReceiveMessageService", action: "duplicateMessage")
+                return
+            }
             guard decoded.resendMessageId == nil else {
                 return
             }
             if (data.category == MessageCategory.SIGNAL_KEY.rawValue) {
                 SignalProtocol.shared.deleteRatchetSenderKey(groupId: data.conversationId, senderId: data.userId)
-                refreshKeys(conversationId: data.conversationId, username: username)
+                refreshKeys(conversationId: data.conversationId)
             } else {
                 insertFailedMessage(data: data)
-                refreshKeys(conversationId: data.conversationId, username: username)
+                refreshKeys(conversationId: data.conversationId)
                 let status = SignalProtocol.shared.getRatchetSenderKeyStatus(groupId: data.conversationId, senderId: data.userId)
                 if status != RatchetStatus.REQUESTING.rawValue {
                     requestResendKey(conversationId: data.conversationId, userId: data.userId, messageId: data.messageId)
@@ -145,13 +146,13 @@ class ReceiveMessageService: MixinService {
         }
     }
 
-    private func refreshKeys(conversationId: String, username: String) {
+    private func refreshKeys(conversationId: String) {
         let now = Date().timeIntervalSince1970
         guard now - (refreshRefreshOneTimePreKeys[conversationId] ?? 0) > 60 else {
             return
         }
         refreshRefreshOneTimePreKeys[conversationId] = now
-        FileManager.default.writeLog(conversationId: conversationId, log: "[ProcessSignalMessage][\(username)]...refreshKeys...")
+        FileManager.default.writeLog(conversationId: conversationId, log: "[ProcessSignalMessage]...refreshKeys...")
         refreshKeys()
     }
 
@@ -180,7 +181,7 @@ class ReceiveMessageService: MixinService {
     }
 
     private func trackDecryptFailed(data: BlazeMessageData, dataHeader: SignalProtocol.ComposeMessageData, error: Error) {
-        guard data.category == MessageCategory.SIGNAL_KEY.rawValue, let signalError = error as? SignalError, signalError != .noSession else {
+        guard let signalError = error as? SignalError, signalError != .noSession else {
             return
         }
         let errorInfo = "\(error)"
@@ -197,7 +198,7 @@ class ReceiveMessageService: MixinService {
         UIApplication.trackError("ReceiveMessageService", action: "signal key decrypt failed \(errorInfo)", userInfo: userInfo)
     }
     
-    private func processDecryptSuccess(data: BlazeMessageData, plainText: String) {
+    private func processDecryptSuccess(data: BlazeMessageData, plainText: String, representativeId: String? = nil) {
         if data.category.hasSuffix("_TEXT") {
             var content = plainText
             if data.category == MessageCategory.PLAIN_TEXT.rawValue {
@@ -207,22 +208,30 @@ class ReceiveMessageService: MixinService {
                 content = decoded
             }
             MessageDAO.shared.insertMessage(message: Message.createMessage(textMessage: content, data: data), messageSource: data.source)
-        } else if data.category.hasSuffix("_IMAGE") || data.category.hasSuffix("_DATA")  {
+        } else if data.category.hasSuffix("_IMAGE") || data.category.hasSuffix("_VIDEO") {
+            guard let base64Data = Data(base64Encoded: plainText), let transferMediaData = (try? jsonDecoder.decode(TransferAttachmentData.self, from: base64Data)) else {
+                return
+            }
+            guard let height = transferMediaData.height, let width = transferMediaData.width, height > 0, width > 0, !(transferMediaData.mimeType?.isEmpty ?? true) else {
+                return
+            }
+            MessageDAO.shared.insertMessage(message: Message.createMessage(mediaData: transferMediaData, data: data), messageSource: data.source)
+        } else if data.category.hasSuffix("_DATA")  {
+            guard let base64Data = Data(base64Encoded: plainText), let transferMediaData = (try? jsonDecoder.decode(TransferAttachmentData.self, from: base64Data)) else {
+                return
+            }
+            guard transferMediaData.size > 0 else {
+                return
+            }
+            MessageDAO.shared.insertMessage(message: Message.createMessage(mediaData: transferMediaData, data: data), messageSource: data.source)
+        } else if data.category.hasSuffix("_AUDIO") {
             guard let base64Data = Data(base64Encoded: plainText), let transferMediaData = (try? jsonDecoder.decode(TransferAttachmentData.self, from: base64Data)) else {
                 return
             }
             MessageDAO.shared.insertMessage(message: Message.createMessage(mediaData: transferMediaData, data: data), messageSource: data.source)
         } else if data.category.hasSuffix("_STICKER") {
-            guard let base64Data = Data(base64Encoded: plainText), let transferStickerData = (try? jsonDecoder.decode(TransferStickerData.self, from: base64Data)) else {
+            guard let transferStickerData = parseSticker(plainText) else {
                 return
-            }
-
-            if !StickerDAO.shared.isExist(albumId: transferStickerData.albumId, name: transferStickerData.name) {
-                do {
-                    try RefreshStickerJob.cacheStickers(albumId: transferStickerData.albumId)
-                } catch {
-                    ConcurrentJobQueue.shared.addJob(job: RefreshStickerJob(albumId: transferStickerData.albumId))
-                }
             }
             MessageDAO.shared.insertMessage(message: Message.createMessage(stickerData: transferStickerData, data: data), messageSource: data.source)
         } else if data.category.hasSuffix("_CONTACT") {
@@ -240,7 +249,7 @@ class ReceiveMessageService: MixinService {
     }
 
     private func insertFailedMessage(data: BlazeMessageData) {
-        guard data.category == MessageCategory.SIGNAL_TEXT.rawValue || data.category == MessageCategory.SIGNAL_IMAGE.rawValue || data.category == MessageCategory.SIGNAL_DATA.rawValue || data.category == MessageCategory.SIGNAL_CONTACT.rawValue || data.category == MessageCategory.SIGNAL_STICKER.rawValue else {
+        guard data.category == MessageCategory.SIGNAL_TEXT.rawValue || data.category == MessageCategory.SIGNAL_IMAGE.rawValue || data.category == MessageCategory.SIGNAL_DATA.rawValue || data.category == MessageCategory.SIGNAL_VIDEO.rawValue || data.category == MessageCategory.SIGNAL_AUDIO.rawValue || data.category == MessageCategory.SIGNAL_CONTACT.rawValue || data.category == MessageCategory.SIGNAL_STICKER.rawValue else {
             return
         }
         var failedMessage = Message.createMessage(messageId: data.messageId, category: data.category, conversationId: data.conversationId, createdAt: data.createdAt, userId: data.userId)
@@ -259,28 +268,21 @@ class ReceiveMessageService: MixinService {
         switch data.category {
         case MessageCategory.SIGNAL_TEXT.rawValue:
             MessageDAO.shared.updateMessageContentAndStatus(content: plainText, status: MessageStatus.DELIVERED.rawValue, messageId: messageId, conversationId: data.conversationId)
-        case MessageCategory.SIGNAL_IMAGE.rawValue, MessageCategory.SIGNAL_DATA.rawValue:
+        case MessageCategory.SIGNAL_IMAGE.rawValue, MessageCategory.SIGNAL_DATA.rawValue, MessageCategory.SIGNAL_VIDEO.rawValue, MessageCategory.SIGNAL_AUDIO.rawValue:
             guard let base64Data = Data(base64Encoded: plainText), let transferMediaData = (try? jsonDecoder.decode(TransferAttachmentData.self, from: base64Data)) else {
                 return
             }
             let mediaStatus: MediaStatus
             switch data.category {
-            case MessageCategory.SIGNAL_DATA.rawValue:
-                mediaStatus = MediaStatus.CANCELED
-            default:
+            case MessageCategory.SIGNAL_IMAGE.rawValue, MessageCategory.SIGNAL_AUDIO.rawValue:
                 mediaStatus = MediaStatus.PENDING
+            default:
+                mediaStatus = MediaStatus.CANCELED
             }
             MessageDAO.shared.updateMediaMessage(mediaData: transferMediaData, status: MessageStatus.DELIVERED.rawValue, messageId: messageId, conversationId: data.conversationId, mediaStatus: mediaStatus)
         case MessageCategory.SIGNAL_STICKER.rawValue:
-            guard let base64Data = Data(base64Encoded: plainText), let transferStickerData = (try? jsonDecoder.decode(TransferStickerData.self, from: base64Data)) else {
+            guard let transferStickerData = parseSticker(plainText) else {
                 return
-            }
-            if !StickerDAO.shared.isExist(albumId: transferStickerData.albumId, name: transferStickerData.name) {
-                do {
-                    try RefreshStickerJob.cacheStickers(albumId: transferStickerData.albumId)
-                } catch {
-                    ConcurrentJobQueue.shared.addJob(job: RefreshStickerJob(albumId: transferStickerData.albumId))
-                }
             }
             MessageDAO.shared.updateStickerMessage(stickerData: transferStickerData, status: MessageStatus.DELIVERED.rawValue, messageId: messageId, conversationId: data.conversationId)
         case MessageCategory.SIGNAL_CONTACT.rawValue:
@@ -299,7 +301,44 @@ class ReceiveMessageService: MixinService {
         }
     }
 
+    private func parseSticker(_ stickerText: String) -> TransferStickerData? {
+        guard let base64Data = Data(base64Encoded: stickerText), let transferStickerData = (try? jsonDecoder.decode(TransferStickerData.self, from: base64Data)) else {
+            return nil
+        }
+
+        if let stickerId = transferStickerData.stickerId, !stickerId.isEmpty {
+            guard !StickerDAO.shared.isExist(stickerId: stickerId) else {
+                return transferStickerData
+            }
+
+            repeat {
+                switch StickerAPI.shared.sticker(stickerId: stickerId) {
+                case let .success(sticker):
+                    StickerDAO.shared.insertOrUpdateSticker(sticker: sticker)
+                    if let stickerUrl = URL(string: sticker.assetUrl) {
+                        DispatchQueue.main.async {
+                            FLAnimatedImageView().sd_setImage(with: stickerUrl, placeholderImage: nil, options: [.continueInBackground, .retryFailed, .refreshCached], completed: nil)
+                        }
+                    }
+                    return transferStickerData
+                case let .failure(error):
+                    guard error.code != 404 else {
+                        return nil
+                    }
+                    checkNetworkAndWebSocket()
+                }
+            } while AccountAPI.shared.didLogin
+            return nil
+        } else if let stickerName = transferStickerData.name, let albumId = transferStickerData.albumId, let sticker = StickerDAO.shared.getSticker(albumId: albumId, name: stickerName) {
+            return TransferStickerData(stickerId: sticker.stickerId, name: nil, albumId: nil)
+        }
+        return nil
+    }
+
     private func syncConversation(data: BlazeMessageData) {
+        guard data.category != MessageCategory.SIGNAL_KEY.rawValue else {
+            return
+        }
         if let status = ConversationDAO.shared.getConversationStatus(conversationId: data.conversationId) {
             if status == ConversationStatus.SUCCESS.rawValue || status == ConversationStatus.QUIT.rawValue {
                 return
@@ -349,10 +388,10 @@ class ReceiveMessageService: MixinService {
             UserDAO.shared.updateUsers(users: [response])
             return .SUCCESS
         case let .failure(error):
-            if tryAgain && error.errorCode != 404 {
+            if tryAgain && error.code != 404 {
                 ConcurrentJobQueue.shared.addJob(job: RefreshUserJob(userIds: [userId]))
             }
-            return error.errorCode == 404 ? .ERROR : .START
+            return error.code == 404 ? .ERROR : .START
         }
     }
 
@@ -370,7 +409,7 @@ class ReceiveMessageService: MixinService {
                 UserDAO.shared.updateUsers(users: [response])
                 return true
             case let .failure(error):
-                guard error.errorCode != 404 else {
+                guard error.code != 404 else {
                     return false
                 }
                 checkNetworkAndWebSocket()
@@ -419,8 +458,11 @@ class ReceiveMessageService: MixinService {
             default:
                 break
             }
-        case MessageCategory.PLAIN_TEXT.rawValue, MessageCategory.PLAIN_IMAGE.rawValue, MessageCategory.PLAIN_DATA.rawValue, MessageCategory.PLAIN_STICKER.rawValue, MessageCategory.PLAIN_CONTACT.rawValue:
-            processDecryptSuccess(data: data, plainText: data.data)
+        case MessageCategory.PLAIN_TEXT.rawValue, MessageCategory.PLAIN_IMAGE.rawValue, MessageCategory.PLAIN_DATA.rawValue, MessageCategory.PLAIN_VIDEO.rawValue, MessageCategory.PLAIN_AUDIO.rawValue, MessageCategory.PLAIN_STICKER.rawValue, MessageCategory.PLAIN_CONTACT.rawValue:
+            if let representativeId = data.representativeId {
+                _ = syncUser(userId: representativeId)
+            }
+            processDecryptSuccess(data: data, plainText: data.data, representativeId: data.representativeId)
             updateRemoteMessageStatus(messageId: data.messageId, status: .DELIVERED, createdAt: data.createdAt)
         default:
             break
@@ -487,8 +529,8 @@ extension ReceiveMessageService {
             return
         }
 
-        if let counterUserId = snapshot.counterUserId {
-            checkUser(userId: counterUserId, tryAgain: true)
+        if let opponentId = snapshot.opponentId {
+            checkUser(userId: opponentId, tryAgain: true)
         }
 
         switch AssetAPI.shared.asset(assetId: snapshot.assetId) {

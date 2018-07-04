@@ -12,10 +12,18 @@ class WithdrawalAPI: BaseAPI {
         }
 
         static let addresses = "addresses"
+        static func address(addressId: String) -> String {
+            return "addresses/\(addressId)"
+        }
+
         static let withdrawals = "withdrawals"
         static func delete(addressId: String) -> String {
             return "addresses/\(addressId)/delete"
         }
+    }
+
+    func address(addressId: String, completion: @escaping (APIResult<Address>) -> Void) {
+        request(method: .get, url: url.address(addressId: addressId), completion: completion)
     }
 
     func addresses(assetId: String, completion: @escaping (APIResult<[Address]>) -> Void) {
@@ -34,7 +42,7 @@ class WithdrawalAPI: BaseAPI {
         KeyUtil.aesEncrypt(pin: withdrawal.pin, completion: completion) { [weak self](encryptedPin) in
             var withdrawal = withdrawal
             withdrawal.pin = encryptedPin
-            self?.request(method: .post, url: url.withdrawals, parameters: withdrawal.toParameters(), encoding: EncodableParameterEncoding<WithdrawalRequest>(), completion: completion)
+            self?.request(method: .post, url: url.withdrawals, parameters: withdrawal.toParameters(), encoding: EncodableParameterEncoding<WithdrawalRequest>(), toastError: false, completion: completion)
         }
     }
 

@@ -4,27 +4,29 @@ extension MessageItem {
 
     private static let deleteAction = [#selector(ConversationTableView.deleteAction(_:))]
     private static let forwardAndDeleteActions = [#selector(ConversationTableView.forwardAction(_:)),
+                                                  #selector(ConversationTableView.deleteAction(_:))]
+    private static let imageActions = [#selector(ConversationTableView.addToStickersAction(_:)),
+                                       #selector(ConversationTableView.forwardAction(_:)),
                                        #selector(ConversationTableView.deleteAction(_:))]
     private static let textActions = [#selector(ConversationTableView.forwardAction(_:)),
                                       #selector(ConversationTableView.copyAction(_:)),
                                       #selector(ConversationTableView.deleteAction(_:))]
 
-    
     var allowedActions: [Selector] {
         if category.hasSuffix("_TEXT") {
             return MessageItem.textActions
-        } else if category.hasSuffix("_IMAGE") {
-            return MessageItem.forwardAndDeleteActions
-        } else if category.hasSuffix("_DATA") {
+        } else if category.hasSuffix("_IMAGE") || category.hasSuffix("_STICKER") {
+            return MessageItem.imageActions
+        } else if category.hasSuffix("_DATA") || category.hasSuffix("_VIDEO") {
             return mediaStatus == MediaStatus.DONE.rawValue ? MessageItem.forwardAndDeleteActions : MessageItem.deleteAction
-        } else if category.hasSuffix("_STICKER") {
-            return MessageItem.forwardAndDeleteActions
         } else if category.hasSuffix("_CONTACT") {
             return MessageItem.forwardAndDeleteActions
         } else if category == MessageCategory.SYSTEM_ACCOUNT_SNAPSHOT.rawValue {
             return MessageItem.deleteAction
         } else if category == MessageCategory.APP_CARD.rawValue {
             return MessageItem.deleteAction
+        } else if category.hasSuffix("_AUDIO") {
+            return MessageItem.forwardAndDeleteActions
         } else {
             return []
         }
@@ -98,6 +100,10 @@ class ConversationTableView: UITableView {
     @objc func deleteAction(_ sender: Any) {
         invokeDelegate(action: .delete)
     }
+
+    @objc func addToStickersAction(_ sender: Any) {
+        invokeDelegate(action: .add)
+    }
     
     @objc func longPressAction(_ recognizer: UIGestureRecognizer) {
         guard recognizer.state == .began, let actionDelegate = actionDelegate else {
@@ -136,11 +142,8 @@ class ConversationTableView: UITableView {
         if let cell = cell as? DetailInfoMessageCell, cell.delegate == nil {
             cell.delegate = viewController
         }
-        if let cell = cell as? PhotoMessageCell, cell.photoMessageDelegate == nil {
-            cell.photoMessageDelegate = viewController
-        }
-        if let cell = cell as? DataMessageCell, cell.cellDelegate == nil {
-            cell.cellDelegate = viewController
+        if let cell = cell as? AttachmentLoadingMessageCell, cell.attachmentLoadingDelegate == nil {
+            cell.attachmentLoadingDelegate = viewController
         }
         if let cell = cell as? TextMessageCell, cell.contentLabel.delegate == nil {
             cell.contentLabel.delegate = viewController
@@ -187,13 +190,16 @@ class ConversationTableView: UITableView {
         register(StickerMessageCell.self, forCellReuseIdentifier: ReuseId.sticker.rawValue)
         register(UnknownMessageCell.self, forCellReuseIdentifier: ReuseId.unknown.rawValue)
         register(AppButtonGroupMessageCell.self, forCellReuseIdentifier: ReuseId.appButtonGroup.rawValue)
+        register(VideoMessageCell.self, forCellReuseIdentifier: ReuseId.video.rawValue)
         longPressRecognizer = UILongPressGestureRecognizer(target: self, action: #selector(longPressAction(_:)))
         longPressRecognizer.delegate = TextMessageLabel.gestureRecognizerBypassingDelegateObject
         addGestureRecognizer(longPressRecognizer)
-        UIMenuController.shared.menuItems = [UIMenuItem(title: Localized.CHAT_MESSAGE_MENU_REPLY, action: #selector(replyAction(_:))),
-                                             UIMenuItem(title: Localized.CHAT_MESSAGE_MENU_FORWARD, action: #selector(forwardAction(_:))),
-                                             UIMenuItem(title: Localized.CHAT_MESSAGE_MENU_COPY, action: #selector(copyAction(_:))),
-                                             UIMenuItem(title: Localized.MENU_DELETE, action: #selector(deleteAction(_:)))]
+        UIMenuController.shared.menuItems = [
+            UIMenuItem(title: Localized.CHAT_MESSAGE_ADD, action: #selector(addToStickersAction(_:))),
+            UIMenuItem(title: Localized.CHAT_MESSAGE_MENU_REPLY, action: #selector(replyAction(_:))),
+            UIMenuItem(title: Localized.CHAT_MESSAGE_MENU_FORWARD, action: #selector(forwardAction(_:))),
+            UIMenuItem(title: Localized.CHAT_MESSAGE_MENU_COPY, action: #selector(copyAction(_:))),
+            UIMenuItem(title: Localized.MENU_DELETE, action: #selector(deleteAction(_:)))]
         NotificationCenter.default.addObserver(self, selector: #selector(menuControllerWillHideMenu(_:)), name: .UIMenuControllerWillHideMenu, object: nil)
     }
     
@@ -206,6 +212,7 @@ extension ConversationTableView {
         case forward
         case copy
         case delete
+        case add
     }
     
     enum ReuseId: String {
@@ -219,7 +226,9 @@ extension ConversationTableView {
         case unreadHint = "UnreadHintMessageCell"
         case appButtonGroup = "AppButtonGroupCell"
         case contact = "ContactMessageCell"
+        case video = "VideoMessageCell"
         case appCard = "AppCardMessageCell"
+        case audio = "AudioMessageCell"
         case header = "DateHeader"
 
         init(category: String) {
@@ -233,6 +242,10 @@ extension ConversationTableView {
                 self = .data
             } else if category.hasSuffix("_CONTACT") {
                 self = .contact
+            } else if category.hasSuffix("_VIDEO") {
+                self = .video
+            } else if category.hasSuffix("_AUDIO") {
+                self = .audio
             } else if category == MessageCategory.SYSTEM_ACCOUNT_SNAPSHOT.rawValue {
                 self = .transfer
             } else if category == MessageCategory.EXT_UNREAD.rawValue {

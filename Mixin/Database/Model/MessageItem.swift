@@ -19,12 +19,13 @@ class MessageItem: TableCodable {
     var mediaKey: Data? = nil
     var mediaDigest: Data? = nil
     var mediaStatus: String? = nil
+    var mediaWaveform: Data? = nil
     var thumbImage: String? = nil
     var status: String = ""
     var participantId: String? = nil
     var snapshotId: String? = nil
     var name: String? = nil
-    var albumId: String? = nil
+    var stickerId: String? = nil
     var createdAt: String = ""
 
     var actionName: String? = nil
@@ -104,12 +105,13 @@ class MessageItem: TableCodable {
         case mediaKey = "media_key"
         case mediaDigest = "media_digest"
         case mediaStatus = "media_status"
+        case mediaWaveform = "media_waveform"
         case thumbImage = "thumb_image"
         case status
         case participantId = "participant_id"
         case snapshotId = "snapshot_id"
         case name
-        case albumId = "album_id"
+        case stickerId = "sticker_id"
         case createdAt = "created_at"
 
         case userFullName
@@ -158,4 +160,17 @@ extension MessageItem {
         return message
     }
 
+}
+
+extension MessageItem {
+
+    func isRepresentativeMessage(conversation: ConversationItem) -> Bool {
+        guard userId != AccountAPI.shared.accountUserId else {
+            return false
+        }
+        guard conversation.category != ConversationCategory.GROUP.rawValue else {
+            return true
+        }
+        return conversation.ownerId != userId && conversation.category == ConversationCategory.CONTACT.rawValue
+    }
 }
